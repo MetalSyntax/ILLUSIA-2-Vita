@@ -21,23 +21,25 @@
 // UI status reported by engine via OnUIStatusChange
 volatile int g_ui_status = -1;
 
-#define SAVE_DIR "ux0:data/illusia2/saves"
+#define SAVE_DIR  "ux0:data/illusia2/games"
+#define SAVE_DIR2 "ux0:data/illusia2/saves"
 
 static void ensure_save_dir(void) {
     sceIoMkdir("ux0:data/illusia2", 0777);
     sceIoMkdir(SAVE_DIR, 0777);
+    sceIoMkdir(SAVE_DIR2, 0777);
 }
 
 // Path resolver for ILLUSIA 2 assets
 static int illusia_resolve_asset_path(const char *name, char *out, size_t out_size) {
     if (!name) return 0;
 
-    // Direct path under ux0:data/illusia2/
-    snprintf(out, out_size, "ux0:data/illusia2/%s", name);
+    // Priority 1: Assets folder path ux0:data/illusia2/assets/
+    snprintf(out, out_size, "ux0:data/illusia2/assets/%s", name);
     if (access(out, F_OK) == 0) return 1;
 
-    // Assets folder path ux0:data/illusia2/assets/
-    snprintf(out, out_size, "ux0:data/illusia2/assets/%s", name);
+    // Priority 2: Direct path under ux0:data/illusia2/
+    snprintf(out, out_size, "ux0:data/illusia2/%s", name);
     if (access(out, F_OK) == 0) return 1;
 
     return 0;
@@ -334,10 +336,12 @@ jobject Illusia_loadFile(jmethodID id, va_list args) {
 
     char path[256];
     snprintf(path, sizeof(path), "%s/%s", SAVE_DIR, name);
-
     FILE *f = fopen(path, "rb");
     if (!f) {
-        // Fallback check in data root
+        snprintf(path, sizeof(path), "%s/%s", SAVE_DIR2, name);
+        f = fopen(path, "rb");
+    }
+    if (!f) {
         snprintf(path, sizeof(path), "ux0:data/illusia2/%s", name);
         f = fopen(path, "rb");
         if (!f) return NULL;
@@ -376,8 +380,13 @@ jint Illusia_isFileExist(jmethodID id, va_list args) {
     if (!name) return 0;
 
     char path[256];
-    snprintf(path, sizeof(path), "%s/%s", SAVE_DIR, name);
     struct stat st;
+    snprintf(path, sizeof(path), "%s/%s", SAVE_DIR, name);
+    if (stat(path, &st) == 0) {
+        return (jint) st.st_size;
+    }
+
+    snprintf(path, sizeof(path), "%s/%s", SAVE_DIR2, name);
     if (stat(path, &st) == 0) {
         return (jint) st.st_size;
     }
@@ -397,6 +406,8 @@ jint Illusia_deleteFile(jmethodID id, va_list args) {
 
     char path[256];
     snprintf(path, sizeof(path), "%s/%s", SAVE_DIR, name);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s", SAVE_DIR2, name);
     unlink(path);
     game_log("[Java] deleteFile: %s\n", name);
     return 1;

@@ -45,16 +45,19 @@ static int audio_port = -1;
 static volatile int audio_running = 0;
 
 static int audio_resolve_path(int snd_id, char *out, size_t out_size) {
+    snprintf(out, out_size, "ux0:data/illusia2/assets/sound/s%03d.ogg", snd_id);
+    if (access(out, F_OK) == 0) return 1;
+
     snprintf(out, out_size, "ux0:data/illusia2/sound/s%03d.ogg", snd_id);
     if (access(out, F_OK) == 0) return 1;
 
-    snprintf(out, out_size, "ux0:data/illusia2/res/raw/s%03d.ogg", snd_id);
+    snprintf(out, out_size, "ux0:data/illusia2/assets/res/raw/s%03d.ogg", snd_id);
     if (access(out, F_OK) == 0) return 1;
 
-    snprintf(out, out_size, "ux0:data/illusia2/raw/s%03d.ogg", snd_id);
+    snprintf(out, out_size, "ux0:data/illusia2/assets/raw/s%03d.ogg", snd_id);
     if (access(out, F_OK) == 0) return 1;
 
-    snprintf(out, out_size, "ux0:data/illusia2/s%03d.ogg", snd_id);
+    snprintf(out, out_size, "ux0:data/illusia2/assets/s%03d.ogg", snd_id);
     if (access(out, F_OK) == 0) return 1;
 
     return 0;
