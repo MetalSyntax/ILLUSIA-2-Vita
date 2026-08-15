@@ -897,6 +897,18 @@ NameToMethodID nameToMethodId[] = {
     { 167, "GFA_SetStringEx", METHOD_TYPE_VOID },
     { 168, "getNumberFromKeyboard", METHOD_TYPE_OBJECT },
     { 169, "getTextFromKeyboard", METHOD_TYPE_OBJECT },
+    { 22,  "GetLanguage", METHOD_TYPE_VOID },
+    { 170, "NetErrorDialog", METHOD_TYPE_VOID },
+    { 170, "NetErrorDialogException", METHOD_TYPE_VOID },
+    { 171, "getLocaleID", METHOD_TYPE_INT },
+    { 172, "setPurchaseChange", METHOD_TYPE_VOID },
+    { 173, "OnEvent", METHOD_TYPE_VOID },
+    { 174, "OnAsyncTimerSet", METHOD_TYPE_VOID },
+    { 175, "GetFileFromHttp", METHOD_TYPE_VOID },
+    { 176, "isGamevilLiveLogined", METHOD_TYPE_INT },
+    { 177, "GFA_SetAntiAlias", METHOD_TYPE_VOID },
+    { 178, "postGPoint", METHOD_TYPE_VOID },
+    { 179, "postLanguage", METHOD_TYPE_VOID },
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -952,6 +964,8 @@ MethodsInt methodsInt[] = {
     { 148, Illusia_IntZero }, // isNexusOne
     { 149, Illusia_IntZero }, // isUserAcceptC2dm
     { 164, Illusia_GFA_GetStringLength },
+    { 171, Illusia_IntZero }, // getLocaleID
+    { 176, Illusia_IntZero }, // isGamevilLiveLogined
 };
 MethodsLong methodsLong[] = {
     { 72, Illusia_getTotalMemory },
@@ -1004,6 +1018,7 @@ MethodsVoid methodsVoid[] = {
     { 12,  Illusia_VoidNoop },
     { 13,  Illusia_VoidNoop },
     { 14,  Illusia_VoidNoop },
+    { 22,  Illusia_VoidNoop }, // GetLanguage
     { 26,  Illusia_VoidNoop },
     { 34,  Illusia_GFA_SetTextSize },
     { 36,  Illusia_GFA_SetColor },
@@ -1083,6 +1098,14 @@ MethodsVoid methodsVoid[] = {
     { 163, Illusia_VoidNoop },
     { 166, Illusia_VoidNoop },
     { 167, Illusia_GFA_SetString },
+    { 170, Illusia_VoidNoop },
+    { 172, Illusia_VoidNoop },
+    { 173, Illusia_VoidNoop },
+    { 174, Illusia_VoidNoop },
+    { 175, Illusia_VoidNoop },
+    { 177, Illusia_VoidNoop },
+    { 178, Illusia_VoidNoop },
+    { 179, Illusia_VoidNoop },
 };
 
 /*

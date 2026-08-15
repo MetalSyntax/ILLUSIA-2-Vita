@@ -20,10 +20,10 @@
 #include <malloc.h>
 #include <pthread.h>
 
-JavaDynArray* javaDynArrays = NULL;
+JavaDynArray** javaDynArrays = NULL;
 pthread_mutex_t* javaDynArrays_mutex = NULL;
-size_t javaDynArrays_free = 0;
-size_t javaDynArrays_taken = 0;
+size_t javaDynArrays_cap = 0;
+size_t javaDynArrays_count = 0;
 
 jfieldID getFieldIdByName(const char* name) {
     for (int i = 0; i < nameToFieldId_size() / sizeof(NameToFieldID); i++) {
@@ -307,22 +307,16 @@ void jda_unlock() {
 // realloc de jda_extend queda solo como fallback (y si llegara a dispararse,
 // los punteros cacheados volverian a invalidarse -- sintoma: "Array 0x...
 // not found" en el log, ver port_progress.md Fase 4.1).
-#define JDA_INITIAL_CAPACITY 1024
+#define JDA_INITIAL_CAPACITY 4096
 
 jboolean jda_tryinit() {
     if (javaDynArrays == NULL) {
-        javaDynArrays = malloc(JDA_INITIAL_CAPACITY * sizeof(JavaDynArray));
+        javaDynArrays = calloc(JDA_INITIAL_CAPACITY, sizeof(JavaDynArray*));
         if (!javaDynArrays)
             return JNI_FALSE;
 
-        for (int i = 0; i < JDA_INITIAL_CAPACITY; ++i) {
-            javaDynArrays[i].array = NULL;
-            javaDynArrays[i].len = -1;
-            javaDynArrays[i].type = FIELD_TYPE_UNKNOWN;
-        }
-
-        javaDynArrays_free = JDA_INITIAL_CAPACITY;
-        javaDynArrays_taken = 0;
+        javaDynArrays_cap = JDA_INITIAL_CAPACITY;
+        javaDynArrays_count = 0;
     }
 
     return JNI_TRUE;
@@ -332,22 +326,18 @@ jboolean jda_extend() {
     if (jda_tryinit() == JNI_FALSE)
         return JNI_FALSE;
 
-    if (javaDynArrays_free == 0) {
-        if (javaDynArrays == NULL)
+    if (javaDynArrays_count >= javaDynArrays_cap) {
+        int new_cap = (javaDynArrays_cap > 0) ? (javaDynArrays_cap * 2) : JDA_INITIAL_CAPACITY;
+        JavaDynArray **grown = realloc(javaDynArrays, new_cap * sizeof(JavaDynArray*));
+        if (!grown)
             return JNI_FALSE;
 
-        javaDynArrays = realloc(javaDynArrays, (sizeof(JavaDynArray) * (javaDynArrays_taken+16)));
-
-        if (javaDynArrays == NULL)
-            return JNI_FALSE;
-
-        for (int i = javaDynArrays_taken; i < javaDynArrays_taken+16; ++i) {
-            javaDynArrays[i].array = NULL;
-            javaDynArrays[i].len = -1;
-            javaDynArrays[i].type = FIELD_TYPE_UNKNOWN;
+        for (int i = javaDynArrays_cap; i < new_cap; ++i) {
+            grown[i] = NULL;
         }
 
-        javaDynArrays_free = 16;
+        javaDynArrays = grown;
+        javaDynArrays_cap = new_cap;
     }
     return JNI_TRUE;
 }
@@ -355,41 +345,31 @@ jboolean jda_extend() {
 JavaDynArray * jda_alloc(jsize len, FIELD_TYPE type) {
     jda_lock();
 
+    if (jda_extend() == JNI_FALSE) {
+        jda_unlock();
+        return NULL;
+    }
+
     void * array = malloc(len * getFieldTypeSize(type));
     if (!array) {
         jda_unlock();
         return NULL;
     }
 
-    if (jda_extend() == JNI_FALSE) {
-        jda_unlock();
+    JavaDynArray * jda = malloc(sizeof(JavaDynArray));
+    if (!jda) {
         free(array);
+        jda_unlock();
         return NULL;
     }
 
-    int index = -1;
-    for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); ++i) {
-        if (javaDynArrays[i].array == NULL) {
-            index = i;
-        }
-    }
+    jda->array = array;
+    jda->len = len;
+    jda->type = type;
 
-    if (index == -1) {
-        jda_unlock();
-        free(array);
-        return NULL;
-    }
-
-    javaDynArrays[index].array = array;
-    javaDynArrays[index].len = len;
-    javaDynArrays[index].type = type;
-
-    javaDynArrays_taken++;
-    javaDynArrays_free--;
-
-    JavaDynArray * ret = &javaDynArrays[index];
+    javaDynArrays[javaDynArrays_count++] = jda;
     jda_unlock();
-    return ret;
+    return jda;
 }
 
 jsize jda_sizeof(JavaDynArray * jda) {
@@ -397,18 +377,13 @@ jsize jda_sizeof(JavaDynArray * jda) {
     if (!javaDynArrays) return -1;
 
     jda_lock();
-    if (javaDynArrays_taken == 0) {
-        jda_unlock();
-        return -1;
-    }
-
-    for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); i++) {
-        if (jda == &javaDynArrays[i]) {
-            if (javaDynArrays[i].array == NULL) {
+    for (size_t i = 0; i < javaDynArrays_count; i++) {
+        if (jda == javaDynArrays[i]) {
+            if (javaDynArrays[i]->array == NULL) {
                 jda_unlock();
                 return -1;
             }
-            jsize ret = javaDynArrays[i].len;
+            jsize ret = javaDynArrays[i]->len;
             jda_unlock();
             return ret;
         }
@@ -423,32 +398,18 @@ jboolean jda_free(JavaDynArray * jda) {
     if (!javaDynArrays) return JNI_FALSE;
 
     jda_lock();
-    if (javaDynArrays_taken == 0) {
-        jda_unlock();
-        return JNI_FALSE;
-    }
-
-    int index = -1;
-    for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); ++i) {
-        if (jda == &javaDynArrays[i]) {
-            index = i;
+    for (size_t i = 0; i < javaDynArrays_count; ++i) {
+        if (jda == javaDynArrays[i]) {
+            if (jda->array) free(jda->array);
+            free(jda);
+            javaDynArrays[i] = javaDynArrays[--javaDynArrays_count];
+            jda_unlock();
+            return JNI_TRUE;
         }
     }
 
-    if (index == -1) {
-        jda_unlock();
-        return JNI_FALSE;
-    }
-
-    free(javaDynArrays[index].array);
-    javaDynArrays[index].array = NULL;
-    javaDynArrays[index].type = FIELD_TYPE_UNKNOWN;
-    javaDynArrays[index].len = 0;
-
-    javaDynArrays_taken--;
-    javaDynArrays_free++;
     jda_unlock();
-    return JNI_TRUE;
+    return JNI_FALSE;
 }
 
 JavaDynArray * jda_find(void * arr) {
@@ -456,18 +417,13 @@ JavaDynArray * jda_find(void * arr) {
     if (!javaDynArrays) return NULL;
 
     jda_lock();
-    if (javaDynArrays_taken == 0) {
-        jda_unlock();
-        return NULL;
-    }
-
-    for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); ++i) {
-        if (arr == &javaDynArrays[i]) {
-            if (javaDynArrays[i].array == NULL) {
+    for (size_t i = 0; i < javaDynArrays_count; ++i) {
+        if (arr == javaDynArrays[i]) {
+            if (javaDynArrays[i]->array == NULL) {
                 jda_unlock();
                 return NULL;
             }
-            JavaDynArray * ret = &javaDynArrays[i];
+            JavaDynArray * ret = javaDynArrays[i];
             jda_unlock();
             return ret;
         }
