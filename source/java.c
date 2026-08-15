@@ -570,6 +570,42 @@ jobject Illusia_GFA_GetPixels16(jmethodID id, va_list args) {
     return (jobject) g_gfa_pixels16_jda;
 }
 
+jfloat Illusia_GFA_GetTextSize(jmethodID id, va_list args) {
+    return (jfloat) g_gfa_text_size;
+}
+
+jlong Illusia_getTotalMemory(jmethodID id, va_list args) {
+    return 256L * 1024 * 1024;
+}
+
+jlong Illusia_getFreeMemory(jmethodID id, va_list args) {
+    return 128L * 1024 * 1024;
+}
+
+jobject Illusia_getVersion(jmethodID id, va_list args) {
+    return (jobject) "1.0.3";
+}
+
+jobject Illusia_getPlayerName(jmethodID id, va_list args) {
+    return illusia_new_byte_array_str("Hero");
+}
+
+jobject Illusia_getPlayerNumberByte(jmethodID id, va_list args) {
+    return illusia_new_byte_array_str("0");
+}
+
+jobject Illusia_getGamevilLiveID(jmethodID id, va_list args) {
+    return illusia_new_byte_array_str("");
+}
+
+jobject Illusia_getGamevilLivePW(jmethodID id, va_list args) {
+    return illusia_new_byte_array_str("");
+}
+
+jobject Illusia_getInetHostAddress(jmethodID id, va_list args) {
+    return illusia_new_byte_array_str("0.0.0.0");
+}
+
 /*
  * Method mappings
  */
@@ -634,6 +670,41 @@ NameToMethodID nameToMethodId[] = {
     { 57, "hideMenuItemComponent", METHOD_TYPE_VOID },
     { 58, "getGPoint", METHOD_TYPE_VOID },
     { 59, "isNetAvailable", METHOD_TYPE_INT },
+    { 60, "hashCode", METHOD_TYPE_INT },
+    { 61, "getCompany", METHOD_TYPE_INT },
+    { 62, "getGameState", METHOD_TYPE_INT },
+    { 63, "getPlayerName", METHOD_TYPE_OBJECT },
+    { 64, "getPlayerNameByte", METHOD_TYPE_OBJECT },
+    { 65, "getPlayerNumberByte", METHOD_TYPE_OBJECT },
+    { 66, "clearPlayerName", METHOD_TYPE_VOID },
+    { 67, "clearNumber", METHOD_TYPE_VOID },
+    { 68, "updateDialogue", METHOD_TYPE_VOID },
+    { 69, "requestIAP", METHOD_TYPE_VOID },
+    { 70, "OnAsyncTimerSet", METHOD_TYPE_VOID },
+    { 71, "GFA_GetTextSize", METHOD_TYPE_FLOAT },
+    { 72, "getTotalMemory", METHOD_TYPE_LONG },
+    { 73, "getMaxMemory", METHOD_TYPE_LONG },
+    { 74, "getFreeMemory", METHOD_TYPE_LONG },
+    { 75, "getUsedMemory", METHOD_TYPE_LONG },
+    { 76, "getVersion", METHOD_TYPE_OBJECT },
+    { 77, "getInetHostAddress", METHOD_TYPE_OBJECT },
+    { 78, "getGamevilLiveID", METHOD_TYPE_OBJECT },
+    { 79, "getGamevilLivePW", METHOD_TYPE_OBJECT },
+    { 80, "reqestGamevilLiveLogin", METHOD_TYPE_VOID },
+    { 81, "showTermsButton", METHOD_TYPE_VOID },
+    { 82, "hideTermsButton", METHOD_TYPE_VOID },
+    { 83, "saveGLOptionLinear", METHOD_TYPE_VOID },
+    { 84, "showBuyShopButton", METHOD_TYPE_VOID },
+    { 85, "hideBuyShopButton", METHOD_TYPE_VOID },
+    { 86, "showBuy", METHOD_TYPE_VOID },
+    { 87, "closeBuy", METHOD_TYPE_VOID },
+    { 88, "setPurchaseChange", METHOD_TYPE_VOID },
+    { 89, "showReplyMoveComponent", METHOD_TYPE_VOID },
+    { 90, "hideReplyMoveComponent", METHOD_TYPE_VOID },
+    { 91, "showAwardGamevilCPIDialog", METHOD_TYPE_VOID },
+    { 92, "getAwardGamevilCPIDialog", METHOD_TYPE_VOID },
+    { 93, "finishApp", METHOD_TYPE_VOID },
+    { 94, "stopAndroidSound", METHOD_TYPE_VOID },
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -643,7 +714,9 @@ MethodsBoolean methodsBoolean[] = {
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
 MethodsDouble methodsDouble[] = {};
-MethodsFloat methodsFloat[] = {};
+MethodsFloat methodsFloat[] = {
+    { 71, Illusia_GFA_GetTextSize },
+};
 MethodsInt methodsInt[] = {
     { 2,  Illusia_isAssetExist },
     { 4,  Illusia_getGLOptionLinear },
@@ -662,8 +735,16 @@ MethodsInt methodsInt[] = {
     { 43, Illusia_GFA_GetColor },
     { 44, Illusia_GFA_GetStringLength },
     { 59, Illusia_IntZero },
+    { 60, Illusia_IntZero }, // hashCode -> 0
+    { 61, Illusia_IntZero }, // getCompany -> 0
+    { 62, Illusia_IntZero }, // getGameState -> 0
 };
-MethodsLong methodsLong[] = {};
+MethodsLong methodsLong[] = {
+    { 72, Illusia_getTotalMemory },
+    { 73, Illusia_getTotalMemory },
+    { 74, Illusia_getFreeMemory },
+    { 75, Illusia_getFreeMemory },
+};
 MethodsObject methodsObject[] = {
     { 1,  Illusia_readAssets },
     { 3,  Illusia_readAssets },
@@ -685,6 +766,13 @@ MethodsObject methodsObject[] = {
     { 51, Illusia_GFA_MeasureText },
     { 52, Illusia_GFA_GetPixels32 },
     { 53, Illusia_GFA_GetPixels16 },
+    { 63, Illusia_getPlayerName },
+    { 64, Illusia_getPlayerName },
+    { 65, Illusia_getPlayerNumberByte },
+    { 76, Illusia_getVersion },
+    { 77, Illusia_getInetHostAddress },
+    { 78, Illusia_getGamevilLiveID },
+    { 79, Illusia_getGamevilLivePW },
 };
 MethodsShort methodsShort[] = {};
 MethodsVoid methodsVoid[] = {
@@ -708,6 +796,26 @@ MethodsVoid methodsVoid[] = {
     { 56, Illusia_VoidNoop },
     { 57, Illusia_VoidNoop },
     { 58, Illusia_VoidNoop },
+    { 66, Illusia_VoidNoop },
+    { 67, Illusia_VoidNoop },
+    { 68, Illusia_VoidNoop },
+    { 69, Illusia_VoidNoop },
+    { 70, Illusia_VoidNoop },
+    { 80, Illusia_VoidNoop },
+    { 81, Illusia_VoidNoop },
+    { 82, Illusia_VoidNoop },
+    { 83, Illusia_VoidNoop },
+    { 84, Illusia_VoidNoop },
+    { 85, Illusia_VoidNoop },
+    { 86, Illusia_VoidNoop },
+    { 87, Illusia_VoidNoop },
+    { 88, Illusia_VoidNoop },
+    { 89, Illusia_VoidNoop },
+    { 90, Illusia_VoidNoop },
+    { 91, Illusia_VoidNoop },
+    { 92, Illusia_VoidNoop },
+    { 93, Illusia_VoidNoop },
+    { 94, Illusia_OnStopSound },
 };
 
 /*

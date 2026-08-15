@@ -52,10 +52,9 @@ extern volatile int g_ui_status;
 
 /* Native JNI function pointers */
 int  (*Game_JNI_OnLoad)(void *vm, void *reserved);
-void (*InitializeJNIGlobalRef)(void);
 void (*NativeInitDeviceInfo)(void *env, void *obj, int w, int h);
 void (*NativeInitWithBufferSize)(void *env, void *obj, int w, int h);
-void (*NativeRender)(void);
+void (*NativeRender)(void *env, void *obj);
 void (*NativeResize)(void *env, void *obj, int w, int h);
 void (*NativeResumeClet)(void *env, void *obj);
 void (*NativePauseClet)(void *env, void *obj);
@@ -161,7 +160,6 @@ int main() {
 
     // 4. Obtener simbolos JNI exportados por libgameDSO.so
     Game_JNI_OnLoad           = (void *)so_symbol(&so_mod, "JNI_OnLoad");
-    InitializeJNIGlobalRef    = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_InitializeJNIGlobalRef");
     NativeInitWithBufferSize  = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativeInitWithBufferSize");
     NativeInitDeviceInfo      = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativeInitDeviceInfo");
     NativeRender              = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativeRender");
@@ -171,17 +169,14 @@ int main() {
     NativeDestroyClet         = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativeDestroyClet");
     handleCletEvent           = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_handleCletEvent");
 
-    game_log("[+] Symbols: JNI_OnLoad=%p InitJNI=%p InitBuffer=%p InitDevice=%p Render=%p Resize=%p Resume=%p handleClet=%p\n",
-             (void*)Game_JNI_OnLoad, (void*)InitializeJNIGlobalRef, (void*)NativeInitWithBufferSize,
+    game_log("[+] Symbols: JNI_OnLoad=%p InitBuffer=%p InitDevice=%p Render=%p Resize=%p Resume=%p handleClet=%p\n",
+             (void*)Game_JNI_OnLoad, (void*)NativeInitWithBufferSize,
              (void*)NativeInitDeviceInfo, (void*)NativeRender, (void*)NativeResize,
              (void*)NativeResumeClet, (void*)handleCletEvent);
 
     // 5. Secuencia de arranque del motor Gamevil Nexus2
     game_log("[*] Ejecutando JNI_OnLoad...\n");
     if (Game_JNI_OnLoad) Game_JNI_OnLoad(&jvm, NULL);
-
-    game_log("[*] Ejecutando InitializeJNIGlobalRef...\n");
-    if (InitializeJNIGlobalRef) InitializeJNIGlobalRef();
 
     game_log("[*] Ejecutando NativeInitWithBufferSize(%d, %d)...\n", GAME_W, GAME_H);
     if (NativeInitWithBufferSize) NativeInitWithBufferSize(jniEnv, NULL, GAME_W, GAME_H);
@@ -268,7 +263,7 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT);
 
         if (NativeRender) {
-            NativeRender();
+            NativeRender(jniEnv, NULL);
         }
 
         vglSwapBuffers(GL_FALSE);
