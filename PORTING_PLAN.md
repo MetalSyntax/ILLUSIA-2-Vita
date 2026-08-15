@@ -88,8 +88,8 @@ Re-ejecutable en cualquier momento con `porting_tools/build/decompile_all.sh`.
 - [x] Skills instaladas en `.agents/skills/`, `.claude/skills/` y configuración del usuario (`psvita-porting`, `so-crash-triage`).
 - [x] APK decompilado (`decompiled/apk_jadx/`) y `.so` decompilados (`decompiled/libgameDSO_armeabi/ghidra/`, `decompiled/libARMPlugin_armeabi/ghidra/`).
 - [x] **Fase 1: Configuración del Loader:** Mapeo de `libgameDSO.so` con `so_util`, relocalización, tabla de dynlib / stubs libc y compilación exitosa de `build/illusia2.vpk`.
-- [ ] **Fase 2: Tabla JNI FalsoJNI:** Implementación de callbacks de audio, input, file I/O y emulación de `com/gamevil/nexus2/Natives`.
-- [ ] **Fase 3: Renderizado Gráfico:** Pipeline de render con `vitaGL` para el framebuffer de Nexus2.
-- [ ] **Fase 4: Input Táctil y Botones Físicos:** Mapeo de controles Vita a eventos táctiles y teclado virtual.
-- [ ] **Fase 5: Audio:** Reproducción de SFX y BGM (`res/raw/*.ogg`).
-- [ ] **Fase 6: LiveArea & VPK:** Empaquetado final y pruebas en hardware real.
+- [x] **Fase 2: Tabla JNI FalsoJNI:** Implementación de callbacks de guardado/carga en `ux0:data/illusia2/saves/`, emulación de Dalvik ArrayObjects para `.pzx`/`.zt1`, Gamevil Font API (GFA) y propiedades del sistema.
+- [x] **Fase 3: Renderizado Gráfico:** Pipeline de render con `vitaGL` a 960x544 con búfer lógico 480x320.
+- [x] **Fase 4: Input Táctil y Botones Físicos:** Mapeo de botones Vita (D-Pad, X, O, □, Δ, L, R, Start, Select) y stick analógico izquierdo a HAL de Nexus2 y multitouch frontal.
+- [x] **Fase 5: Audio:** Mezclador multicanal en hilo dedicado con `Tremor` (`libvorbisidec`) y `SceAudioOut` para BGM en loop y 4 voces SFX simultáneas.
+- [x] **Fase 6: LiveArea & VPK:** Generación de `icon0.png`, `bg0.png`, `pic0.png`, `startup.png` y empaquetado VPK completo.

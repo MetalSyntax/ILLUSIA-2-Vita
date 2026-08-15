@@ -30,6 +30,7 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 #include "utils/dialog.h"
+#include "audio.h"
 
 #define GAME_W 480
 #define GAME_H 320
@@ -105,7 +106,10 @@ static const struct { unsigned int btn; int hal; } btn_map[] = {
     { SCE_CTRL_CIRCLE,   HAL_KEY_BACK },
     { SCE_CTRL_TRIANGLE, HAL_KEY_SKIP },
     { SCE_CTRL_SQUARE,   HAL_KEY_MAP },
-    { SCE_CTRL_LTRIGGER, HAL_KEY_SAVE },
+    { SCE_CTRL_LTRIGGER, 49 }, // Key '1'
+    { SCE_CTRL_RTRIGGER, 51 }, // Key '3'
+    { SCE_CTRL_SELECT,   -7 }, // Soft2
+    { SCE_CTRL_START,    -6 }, // Soft1
 };
 #define BTN_MAP_COUNT (sizeof(btn_map) / sizeof(btn_map[0]))
 
@@ -151,8 +155,9 @@ int main() {
 
     jni_init();
     illusia_install_array_hooks();
+    audio_init();
     JNIEnv *jniEnv = &jni;
-    game_log("[+] FalsoJNI inicializado.\n");
+    game_log("[+] FalsoJNI y Audio inicializados.\n");
 
     // 4. Obtener simbolos JNI exportados por libgameDSO.so
     Game_JNI_OnLoad           = (void *)so_symbol(&so_mod, "JNI_OnLoad");
@@ -216,8 +221,14 @@ int main() {
             break;
         }
 
-        unsigned int pressed = pad.buttons & ~old_buttons;
-        unsigned int released = old_buttons & ~pad.buttons;
+        unsigned int cur_buttons = pad.buttons;
+        if (pad.ly < 128 - 40) cur_buttons |= SCE_CTRL_UP;
+        if (pad.ly > 128 + 40) cur_buttons |= SCE_CTRL_DOWN;
+        if (pad.lx < 128 - 40) cur_buttons |= SCE_CTRL_LEFT;
+        if (pad.lx > 128 + 40) cur_buttons |= SCE_CTRL_RIGHT;
+
+        unsigned int pressed = cur_buttons & ~old_buttons;
+        unsigned int released = old_buttons & ~cur_buttons;
 
         for (size_t i = 0; i < BTN_MAP_COUNT; i++) {
             if (pressed & btn_map[i].btn)
@@ -225,7 +236,7 @@ int main() {
             if (released & btn_map[i].btn)
                 queue_input_event(MH_KEY_RELEASEEVENT, btn_map[i].hal, 0, 0);
         }
-        old_buttons = pad.buttons;
+        old_buttons = cur_buttons;
 
         // Mapeo táctil al espacio lógico GAME_W x GAME_H (480x320)
         if (touch.reportNum > 0) {
@@ -265,6 +276,7 @@ int main() {
 
     if (NativePauseClet) NativePauseClet(jniEnv, NULL);
     if (NativeDestroyClet) NativeDestroyClet(jniEnv, NULL);
+    audio_shutdown();
 
     game_log("[*] ILLUSIA 2 finalizado correctamente.\n");
     sceKernelExitProcess(0);
