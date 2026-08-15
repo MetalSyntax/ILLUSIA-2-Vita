@@ -46,18 +46,30 @@ static int illusia_resolve_asset_path(const char *name, char *out, size_t out_si
 }
 
 /*
- * Dalvik ArrayObject registry for seamless JNI array handling
+ * Dalvik ArrayObject registry for seamless JNI array handling.
+ * Grows dynamically: a session can create far more than a few hundred of
+ * these (one per readAssets/loadFile call), and silently dropping
+ * registration past a fixed cap made later arrays fall through to the real
+ * FalsoJNI GetArrayLength/GetByteArrayElements, which misread our
+ * malloc(16+size) layout as their own array representation and corrupted
+ * memory.
  */
-#define DALVIK_REGISTRY_MAX 1024
-static void *g_dalvik_registry[DALVIK_REGISTRY_MAX];
+static void **g_dalvik_registry = NULL;
 static int g_dalvik_registry_count = 0;
+static int g_dalvik_registry_cap = 0;
 
 static void illusia_register_dalvik_array(void *ptr) {
-    if (g_dalvik_registry_count < DALVIK_REGISTRY_MAX) {
-        g_dalvik_registry[g_dalvik_registry_count++] = ptr;
-    } else {
-        game_log("[Java] Warning: Dalvik array registry full (%d)\n", DALVIK_REGISTRY_MAX);
+    if (g_dalvik_registry_count >= g_dalvik_registry_cap) {
+        int new_cap = g_dalvik_registry_cap ? g_dalvik_registry_cap * 2 : 1024;
+        void **grown = realloc(g_dalvik_registry, sizeof(void *) * new_cap);
+        if (!grown) {
+            game_log("[Java] Warning: Dalvik array registry realloc failed (cap %d)\n", g_dalvik_registry_cap);
+            return;
+        }
+        g_dalvik_registry = grown;
+        g_dalvik_registry_cap = new_cap;
     }
+    g_dalvik_registry[g_dalvik_registry_count++] = ptr;
 }
 
 static int illusia_is_dalvik_array(void *ptr) {
@@ -121,7 +133,7 @@ void illusia_install_array_hooks(void) {
  * Method Implementations
  */
 static int readassets_log_count = 0;
-#define READASSETS_LOG_MAX 30
+#define READASSETS_LOG_MAX 4000
 
 jobject Illusia_readAssets(jmethodID id, va_list args) {
     jstring filename = va_arg(args, jstring);
@@ -176,7 +188,7 @@ jobject Illusia_readAssets(jmethodID id, va_list args) {
 }
 
 static int isassetexist_log_count = 0;
-#define ISASSETEXIST_LOG_MAX 30
+#define ISASSETEXIST_LOG_MAX 4000
 
 jint Illusia_isAssetExist(jmethodID id, va_list args) {
     jstring filename = va_arg(args, jstring);
@@ -358,20 +370,17 @@ jobject Illusia_loadFile(jmethodID id, va_list args) {
         return NULL;
     }
 
-    void *array_obj = malloc(16 + size);
-    if (!array_obj) {
+    JavaDynArray *jda = jda_alloc((jsize) size, FIELD_TYPE_BYTE);
+    if (!jda) {
         fclose(f);
         return NULL;
     }
 
-    memset(array_obj, 0, 16);
-    *(uint32_t *)((char *)array_obj + 8) = (uint32_t)size;
-    fread((char *) array_obj + 16, 1, size, f);
+    fread(jda->array, 1, size, f);
     fclose(f);
 
-    illusia_register_dalvik_array(array_obj);
     game_log("[Java] loadFile: %s (%ld bytes loaded)\n", name, size);
-    return (jobject) array_obj;
+    return (jobject) jda;
 }
 
 jint Illusia_isFileExist(jmethodID id, va_list args) {
@@ -524,14 +533,109 @@ jint Illusia_GFA_GetColor(jmethodID id, va_list args) {
     return (jint) g_gfa_color;
 }
 
+static int g_gfa_str_len = 0;
+
 jint Illusia_GFA_GetStringLength(jmethodID id, va_list args) {
-    return 0;
+    return (jint) g_gfa_str_len;
 }
 
 void Illusia_GFA_SetString(jmethodID id, va_list args) {
+    jstring str = va_arg(args, jstring);
+    int len = va_arg(args, int);
+    const char *s = (const char *) str;
+    if (s) {
+        g_gfa_str_len = len > 0 ? len : (int) strlen(s);
+    } else {
+        g_gfa_str_len = len > 0 ? len : 0;
+    }
 }
 
 void Illusia_GFA_SetStringFromUnicode(jmethodID id, va_list args) {
+    jbyteArray arr = va_arg(args, jbyteArray);
+    if (!arr) { g_gfa_str_len = 0; return; }
+    if (illusia_is_dalvik_array(arr)) {
+        g_gfa_str_len = (*(int *)((char *)arr + 8)) / 2;
+    } else {
+        JavaDynArray *jda = (JavaDynArray *)arr;
+        g_gfa_str_len = jda->len / 2;
+    }
+}
+
+void Illusia_GFA_SetStringFromKSC5601(jmethodID id, va_list args) {
+    jbyteArray arr = va_arg(args, jbyteArray);
+    if (!arr) { g_gfa_str_len = 0; return; }
+    if (illusia_is_dalvik_array(arr)) {
+        g_gfa_str_len = *(int *)((char *)arr + 8);
+    } else {
+        JavaDynArray *jda = (JavaDynArray *)arr;
+        g_gfa_str_len = jda->len;
+    }
+}
+
+jfloat Illusia_GFA_GetTextWidth(jmethodID id, va_list args) {
+    jstring str = va_arg(args, jstring);
+    int len = va_arg(args, int);
+    const char *s = (const char *) str;
+    int count = len;
+    if (count <= 0 && s) count = (int) strlen(s);
+    return (jfloat)(count * g_gfa_text_size * 0.6f);
+}
+
+jint Illusia_GFA_GetWordwrapPositionEx(jmethodID id, va_list args) {
+    float maxWidth = (float) va_arg(args, double);
+    JavaDynArray *ww = (JavaDynArray *) va_arg(args, jobject);
+    int32_t *positions = NULL;
+    int ww_cap = 0;
+
+    if (ww) {
+        if (illusia_is_dalvik_array(ww)) {
+            ww_cap = *(int *)((char *)ww + 8);
+            positions = (int32_t *)((char *)ww + 16);
+        } else {
+            positions = (int32_t *) ww->array;
+            ww_cap = ww->len;
+        }
+    }
+
+    int char_w = (int)(g_gfa_text_size * 0.6f);
+    if (char_w <= 0) char_w = 8;
+    int chars_per_line = (int)(maxWidth / char_w);
+    if (chars_per_line <= 0) chars_per_line = 20;
+
+    int sub_len = g_gfa_str_len;
+    int ww_count = 0;
+    int pos = 0;
+
+    while (sub_len > 0 && chars_per_line < sub_len) {
+        sub_len -= chars_per_line;
+        pos += chars_per_line;
+        if (positions && ww_count < ww_cap) {
+            positions[ww_count] = pos;
+        }
+        ww_count++;
+    }
+    return (jint) ww_count;
+}
+
+jint Illusia_GFA_GetWordwrapPosition(jmethodID id, va_list args) {
+    int line_idx = va_arg(args, int);
+    float maxWidth = (float) va_arg(args, double);
+
+    if (g_gfa_str_len <= 0) return 0;
+
+    int char_w = (int)(g_gfa_text_size * 0.6f);
+    if (char_w <= 0) char_w = 8;
+    int chars_per_line = (int)(maxWidth / char_w);
+    if (chars_per_line <= 0) chars_per_line = 20;
+
+    if (line_idx < 0) {
+        int lines = (g_gfa_str_len + chars_per_line - 1) / chars_per_line;
+        return (jint) lines;
+    }
+
+    int pos = (line_idx + 1) * chars_per_line;
+    if (pos > g_gfa_str_len) pos = g_gfa_str_len;
+    return (jint) pos;
 }
 
 void Illusia_GFA_ReleaseFont(jmethodID id, va_list args) {
@@ -606,138 +710,208 @@ jobject Illusia_getInetHostAddress(jmethodID id, va_list args) {
     return illusia_new_byte_array_str("0.0.0.0");
 }
 
+jobject Illusia_getGestureName(jmethodID id, va_list args) {
+    return (jobject) "GESTURE_NONE";
+}
+
 /*
  * Method mappings
  */
 NameToMethodID nameToMethodId[] = {
-    { 1,  "readAssets", METHOD_TYPE_OBJECT },
-    { 2,  "isAssetExist", METHOD_TYPE_INT },
-    { 3,  "readAssete", METHOD_TYPE_OBJECT },
-    { 4,  "getGLOptionLinear", METHOD_TYPE_INT },
-    { 5,  "SetSpeed", METHOD_TYPE_VOID },
-    { 6,  "getPhoneModel", METHOD_TYPE_OBJECT },
-    { 7,  "getAbsolueFilePath", METHOD_TYPE_OBJECT },
-    { 8,  "OnUIStatusChange", METHOD_TYPE_VOID },
-    { 9,  "OnSoundPlay", METHOD_TYPE_VOID },
-    { 10, "OnStopSound", METHOD_TYPE_VOID },
-    { 11, "hideLoadingDialog", METHOD_TYPE_VOID },
-    { 12, "OnShowSaveButton", METHOD_TYPE_VOID },
-    { 13, "OnVibrate", METHOD_TYPE_VOID },
-    { 14, "OnEvent", METHOD_TYPE_VOID },
-    { 15, "getPhoneNumber", METHOD_TYPE_OBJECT },
-    { 16, "getMacAddress", METHOD_TYPE_OBJECT },
-    { 17, "getDeviceID", METHOD_TYPE_OBJECT },
-    { 18, "getAndroidID", METHOD_TYPE_OBJECT },
-    { 19, "getOsVersion", METHOD_TYPE_OBJECT },
-    { 20, "getDeviceType", METHOD_TYPE_OBJECT },
-    { 21, "getSimSerialNumber", METHOD_TYPE_OBJECT },
-    { 22, "getLanguage", METHOD_TYPE_OBJECT },
-    { 23, "getCarrierName", METHOD_TYPE_OBJECT },
-    { 24, "getLocaleID", METHOD_TYPE_INT },
-    { 25, "isGamevilLiveLogined", METHOD_TYPE_INT },
-    { 26, "TrackEventDispatch", METHOD_TYPE_VOID },
-    { 27, "loadFile", METHOD_TYPE_OBJECT },
-    { 28, "saveFile", METHOD_TYPE_INT },
-    { 29, "deleteFile", METHOD_TYPE_INT },
-    { 30, "isFileExist", METHOD_TYPE_INT },
-    { 31, "loadFileFromStorage", METHOD_TYPE_OBJECT },
+    { 1,   "readAssets", METHOD_TYPE_OBJECT },
+    { 2,   "isAssetExist", METHOD_TYPE_INT },
+    { 3,   "readAssete", METHOD_TYPE_OBJECT },
+    { 4,   "getGLOptionLinear", METHOD_TYPE_INT },
+    { 5,   "SetSpeed", METHOD_TYPE_VOID },
+    { 6,   "getPhoneModel", METHOD_TYPE_OBJECT },
+    { 7,   "getAbsolueFilePath", METHOD_TYPE_OBJECT },
+    { 8,   "OnUIStatusChange", METHOD_TYPE_VOID },
+    { 9,   "OnSoundPlay", METHOD_TYPE_VOID },
+    { 10,  "OnStopSound", METHOD_TYPE_VOID },
+    { 11,  "hideLoadingDialog", METHOD_TYPE_VOID },
+    { 12,  "OnShowSaveButton", METHOD_TYPE_VOID },
+    { 13,  "OnVibrate", METHOD_TYPE_VOID },
+    { 14,  "OnEvent", METHOD_TYPE_VOID },
+    { 15,  "getPhoneNumber", METHOD_TYPE_OBJECT },
+    { 16,  "getMacAddress", METHOD_TYPE_OBJECT },
+    { 17,  "getDeviceID", METHOD_TYPE_OBJECT },
+    { 18,  "getAndroidID", METHOD_TYPE_OBJECT },
+    { 19,  "getOsVersion", METHOD_TYPE_OBJECT },
+    { 20,  "getDeviceType", METHOD_TYPE_OBJECT },
+    { 21,  "getSimSerialNumber", METHOD_TYPE_OBJECT },
+    { 22,  "getLanguage", METHOD_TYPE_OBJECT },
+    { 23,  "getCarrierName", METHOD_TYPE_OBJECT },
+    { 24,  "getLocaleID", METHOD_TYPE_INT },
+    { 25,  "isGamevilLiveLogined", METHOD_TYPE_INT },
+    { 26,  "TrackEventDispatch", METHOD_TYPE_VOID },
+    { 27,  "loadFile", METHOD_TYPE_OBJECT },
+    { 28,  "saveFile", METHOD_TYPE_INT },
+    { 29,  "deleteFile", METHOD_TYPE_INT },
+    { 30,  "isFileExist", METHOD_TYPE_INT },
+    { 31,  "loadFileFromStorage", METHOD_TYPE_OBJECT },
     // GFA (Gamevil Font API)
-    { 32, "GFA_IsInitialized", METHOD_TYPE_BOOLEAN },
-    { 33, "GFA_Init", METHOD_TYPE_BOOLEAN },
-    { 34, "GFA_SetTextSize", METHOD_TYPE_VOID },
-    { 35, "GFA_CreateFont", METHOD_TYPE_INT },
-    { 36, "GFA_SetColor", METHOD_TYPE_VOID },
-    { 37, "GFA_SetFont", METHOD_TYPE_INT },
-    { 38, "GFA_CharWidth", METHOD_TYPE_INT },
-    { 39, "GFA_CharHeight", METHOD_TYPE_INT },
-    { 40, "GFA_GetAscent", METHOD_TYPE_INT },
-    { 41, "GFA_GetDescent", METHOD_TYPE_INT },
-    { 42, "GFA_GetCurrentFont", METHOD_TYPE_INT },
-    { 43, "GFA_GetColor", METHOD_TYPE_INT },
-    { 44, "GFA_GetStringLength", METHOD_TYPE_INT },
-    { 45, "GFA_SetString", METHOD_TYPE_VOID },
-    { 46, "GFA_SetStringFromUnicode", METHOD_TYPE_VOID },
-    { 47, "GFA_ReleaseFont", METHOD_TYPE_VOID },
-    { 48, "GFA_Release", METHOD_TYPE_VOID },
-    { 49, "GFA_DrawFont", METHOD_TYPE_OBJECT },
-    { 50, "GFA_DrawText", METHOD_TYPE_OBJECT },
-    { 51, "GFA_MeasureText", METHOD_TYPE_OBJECT },
-    { 52, "GFA_GetPixels32", METHOD_TYPE_OBJECT },
-    { 53, "GFA_GetPixels16", METHOD_TYPE_OBJECT },
-    { 54, "hideTitleComponent", METHOD_TYPE_VOID },
-    { 55, "hidePurchaseComponent", METHOD_TYPE_VOID },
-    { 56, "hideMenuComponent", METHOD_TYPE_VOID },
-    { 57, "hideMenuItemComponent", METHOD_TYPE_VOID },
-    { 58, "getGPoint", METHOD_TYPE_VOID },
-    { 59, "isNetAvailable", METHOD_TYPE_INT },
-    { 60, "hashCode", METHOD_TYPE_INT },
-    { 61, "getCompany", METHOD_TYPE_INT },
-    { 62, "getGameState", METHOD_TYPE_INT },
-    { 63, "getPlayerName", METHOD_TYPE_OBJECT },
-    { 64, "getPlayerNameByte", METHOD_TYPE_OBJECT },
-    { 65, "getPlayerNumberByte", METHOD_TYPE_OBJECT },
-    { 66, "clearPlayerName", METHOD_TYPE_VOID },
-    { 67, "clearNumber", METHOD_TYPE_VOID },
-    { 68, "updateDialogue", METHOD_TYPE_VOID },
-    { 69, "requestIAP", METHOD_TYPE_VOID },
-    { 70, "OnAsyncTimerSet", METHOD_TYPE_VOID },
-    { 71, "GFA_GetTextSize", METHOD_TYPE_FLOAT },
-    { 72, "getTotalMemory", METHOD_TYPE_LONG },
-    { 73, "getMaxMemory", METHOD_TYPE_LONG },
-    { 74, "getFreeMemory", METHOD_TYPE_LONG },
-    { 75, "getUsedMemory", METHOD_TYPE_LONG },
-    { 76, "getVersion", METHOD_TYPE_OBJECT },
-    { 77, "getInetHostAddress", METHOD_TYPE_OBJECT },
-    { 78, "getGamevilLiveID", METHOD_TYPE_OBJECT },
-    { 79, "getGamevilLivePW", METHOD_TYPE_OBJECT },
-    { 80, "reqestGamevilLiveLogin", METHOD_TYPE_VOID },
-    { 81, "showTermsButton", METHOD_TYPE_VOID },
-    { 82, "hideTermsButton", METHOD_TYPE_VOID },
-    { 83, "saveGLOptionLinear", METHOD_TYPE_VOID },
-    { 84, "showBuyShopButton", METHOD_TYPE_VOID },
-    { 85, "hideBuyShopButton", METHOD_TYPE_VOID },
-    { 86, "showBuy", METHOD_TYPE_VOID },
-    { 87, "closeBuy", METHOD_TYPE_VOID },
-    { 88, "setPurchaseChange", METHOD_TYPE_VOID },
-    { 89, "showReplyMoveComponent", METHOD_TYPE_VOID },
-    { 90, "hideReplyMoveComponent", METHOD_TYPE_VOID },
-    { 91, "showAwardGamevilCPIDialog", METHOD_TYPE_VOID },
-    { 92, "getAwardGamevilCPIDialog", METHOD_TYPE_VOID },
-    { 93, "finishApp", METHOD_TYPE_VOID },
-    { 94, "stopAndroidSound", METHOD_TYPE_VOID },
+    { 32,  "GFA_IsInitialized", METHOD_TYPE_BOOLEAN },
+    { 33,  "GFA_Init", METHOD_TYPE_BOOLEAN },
+    { 34,  "GFA_SetTextSize", METHOD_TYPE_VOID },
+    { 35,  "GFA_CreateFont", METHOD_TYPE_INT },
+    { 36,  "GFA_SetColor", METHOD_TYPE_VOID },
+    { 37,  "GFA_SetFont", METHOD_TYPE_INT },
+    { 38,  "GFA_CharWidth", METHOD_TYPE_INT },
+    { 39,  "GFA_CharHeight", METHOD_TYPE_INT },
+    { 40,  "GFA_GetAscent", METHOD_TYPE_INT },
+    { 41,  "GFA_GetDescent", METHOD_TYPE_INT },
+    { 42,  "GFA_GetCurrentFont", METHOD_TYPE_INT },
+    { 43,  "GFA_GetColor", METHOD_TYPE_INT },
+    { 44,  "GFA_GetStringLength", METHOD_TYPE_INT },
+    { 45,  "GFA_SetString", METHOD_TYPE_VOID },
+    { 46,  "GFA_SetStringFromUnicode", METHOD_TYPE_VOID },
+    { 47,  "GFA_ReleaseFont", METHOD_TYPE_VOID },
+    { 48,  "GFA_Release", METHOD_TYPE_VOID },
+    { 49,  "GFA_DrawFont", METHOD_TYPE_OBJECT },
+    { 50,  "GFA_DrawText", METHOD_TYPE_OBJECT },
+    { 51,  "GFA_MeasureText", METHOD_TYPE_OBJECT },
+    { 52,  "GFA_GetPixels32", METHOD_TYPE_OBJECT },
+    { 53,  "GFA_GetPixels16", METHOD_TYPE_OBJECT },
+    { 54,  "hideTitleComponent", METHOD_TYPE_VOID },
+    { 55,  "hidePurchaseComponent", METHOD_TYPE_VOID },
+    { 56,  "hideMenuComponent", METHOD_TYPE_VOID },
+    { 57,  "hideMenuItemComponent", METHOD_TYPE_VOID },
+    { 58,  "getGPoint", METHOD_TYPE_VOID },
+    { 59,  "isNetAvailable", METHOD_TYPE_INT },
+    { 60,  "hashCode", METHOD_TYPE_INT },
+    { 61,  "getCompany", METHOD_TYPE_INT },
+    { 62,  "getGameState", METHOD_TYPE_INT },
+    { 63,  "getPlayerName", METHOD_TYPE_OBJECT },
+    { 64,  "getPlayerNameByte", METHOD_TYPE_OBJECT },
+    { 65,  "getPlayerNumberByte", METHOD_TYPE_OBJECT },
+    { 66,  "clearPlayerName", METHOD_TYPE_VOID },
+    { 67,  "clearNumber", METHOD_TYPE_VOID },
+    { 68,  "updateDialogue", METHOD_TYPE_VOID },
+    { 69,  "requestIAP", METHOD_TYPE_VOID },
+    { 70,  "OnAsyncTimerSet", METHOD_TYPE_VOID },
+    { 71,  "GFA_GetTextSize", METHOD_TYPE_FLOAT },
+    { 72,  "getTotalMemory", METHOD_TYPE_LONG },
+    { 73,  "getMaxMemory", METHOD_TYPE_LONG },
+    { 74,  "getFreeMemory", METHOD_TYPE_LONG },
+    { 75,  "getUsedMemory", METHOD_TYPE_LONG },
+    { 76,  "getVersion", METHOD_TYPE_OBJECT },
+    { 77,  "getInetHostAddress", METHOD_TYPE_OBJECT },
+    { 78,  "getGamevilLiveID", METHOD_TYPE_OBJECT },
+    { 79,  "getGamevilLivePW", METHOD_TYPE_OBJECT },
+    { 80,  "reqestGamevilLiveLogin", METHOD_TYPE_VOID },
+    { 81,  "showTermsButton", METHOD_TYPE_VOID },
+    { 82,  "hideTermsButton", METHOD_TYPE_VOID },
+    { 83,  "saveGLOptionLinear", METHOD_TYPE_VOID },
+    { 84,  "showBuyShopButton", METHOD_TYPE_VOID },
+    { 85,  "hideBuyShopButton", METHOD_TYPE_VOID },
+    { 86,  "showBuy", METHOD_TYPE_VOID },
+    { 87,  "closeBuy", METHOD_TYPE_VOID },
+    { 88,  "setPurchaseChange", METHOD_TYPE_VOID },
+    { 89,  "showReplyMoveComponent", METHOD_TYPE_VOID },
+    { 90,  "hideReplyMoveComponent", METHOD_TYPE_VOID },
+    { 91,  "showAwardGamevilCPIDialog", METHOD_TYPE_VOID },
+    { 92,  "getAwardGamevilCPIDialog", METHOD_TYPE_VOID },
+    { 93,  "finishApp", METHOD_TYPE_VOID },
+    { 94,  "stopAndroidSound", METHOD_TYPE_VOID },
+    { 95,  "GFA_GetWordwrapPositionEx", METHOD_TYPE_INT },
+    { 96,  "GFA_GetWordwrapPosition", METHOD_TYPE_INT },
+    { 97,  "GFA_GetTextWidth", METHOD_TYPE_FLOAT },
+    { 98,  "GFA_SetAntiAlias", METHOD_TYPE_VOID },
+    { 99,  "GFA_SetLocale", METHOD_TYPE_VOID },
+    { 100, "GFA_SetTextAlign", METHOD_TYPE_VOID },
+    { 101, "GFA_SetStringFromKSC5601", METHOD_TYPE_VOID },
+    { 102, "NexusSetMaxLengthTextInput", METHOD_TYPE_VOID },
+    { 103, "NexusSetMaxLengthNumberInput", METHOD_TYPE_VOID },
+    { 104, "NexusSetMaxLengthNumInput", METHOD_TYPE_VOID },
+    { 105, "setMaxLengthNumInput", METHOD_TYPE_VOID },
+    { 106, "NexusSetText", METHOD_TYPE_VOID },
+    { 107, "setTapjoyReady", METHOD_TYPE_VOID },
+    { 108, "openPurchasePopup", METHOD_TYPE_VOID },
+    { 109, "openStoreWithProductId", METHOD_TYPE_VOID },
+    { 110, "openUrl", METHOD_TYPE_VOID },
+    { 111, "startPurchase", METHOD_TYPE_VOID },
+    { 112, "requestOfferwall", METHOD_TYPE_VOID },
+    { 113, "requestGamevilGift", METHOD_TYPE_VOID },
+    { 114, "isOfferwallEnabled", METHOD_TYPE_INT },
+    { 115, "getGamevilGiftString", METHOD_TYPE_OBJECT },
+    { 116, "resumeSound", METHOD_TYPE_VOID },
+    { 117, "vibrateAndroid", METHOD_TYPE_VOID },
+    { 118, "showPurchaseComponent", METHOD_TYPE_VOID },
+    { 119, "showShopButton", METHOD_TYPE_VOID },
+    { 120, "hideShopButton", METHOD_TYPE_VOID },
+    { 121, "showLoadingDialog", METHOD_TYPE_VOID },
+    { 122, "HideLoadingDialog", METHOD_TYPE_VOID },
+    { 123, "NexusTouchGestureEnable", METHOD_TYPE_VOID },
+    { 124, "NexusTouchGestureName", METHOD_TYPE_OBJECT },
+    { 125, "NexusTouchInitGestureName", METHOD_TYPE_VOID },
+    { 126, "NexusTouchSetCheckGesture", METHOD_TYPE_VOID },
+    { 127, "NexusTouchSetShowGestureLine", METHOD_TYPE_VOID },
+    { 128, "NexusTouchSimpleFlingEnable", METHOD_TYPE_VOID },
+    { 129, "NexusSensorEnable", METHOD_TYPE_VOID },
+    { 130, "NexusSensorOrientationType", METHOD_TYPE_VOID },
+    { 131, "GetNexusSensorXAngle", METHOD_TYPE_INT },
+    { 132, "GetNexusSensorXInc", METHOD_TYPE_INT },
+    { 133, "GetNexusSensorYAngle", METHOD_TYPE_INT },
+    { 134, "GetNexusSensorYInc", METHOD_TYPE_INT },
+    { 135, "IsNexusSensorBottomAcceleration", METHOD_TYPE_BOOLEAN },
+    { 136, "IsNexusSensorBottomOrientation", METHOD_TYPE_BOOLEAN },
+    { 137, "IsNexusSensorLeftAcceleration", METHOD_TYPE_BOOLEAN },
+    { 138, "IsNexusSensorLeftOrientation", METHOD_TYPE_BOOLEAN },
+    { 139, "IsNexusSensorRightAcceleration", METHOD_TYPE_BOOLEAN },
+    { 140, "IsNexusSensorRightOrientation", METHOD_TYPE_BOOLEAN },
+    { 141, "IsNexusSensorShakeDevice", METHOD_TYPE_BOOLEAN },
+    { 142, "IsNexusSensorTopAcceleration", METHOD_TYPE_BOOLEAN },
+    { 143, "IsNexusSensorTopOrientation", METHOD_TYPE_BOOLEAN },
 };
 
 MethodsBoolean methodsBoolean[] = {
-    { 32, Illusia_GFA_IsInitialized },
-    { 33, Illusia_GFA_Init },
+    { 32,  Illusia_GFA_IsInitialized },
+    { 33,  Illusia_GFA_Init },
+    { 135, (void *) Illusia_IntZero },
+    { 136, (void *) Illusia_IntZero },
+    { 137, (void *) Illusia_IntZero },
+    { 138, (void *) Illusia_IntZero },
+    { 139, (void *) Illusia_IntZero },
+    { 140, (void *) Illusia_IntZero },
+    { 141, (void *) Illusia_IntZero },
+    { 142, (void *) Illusia_IntZero },
+    { 143, (void *) Illusia_IntZero },
 };
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
 MethodsDouble methodsDouble[] = {};
 MethodsFloat methodsFloat[] = {
     { 71, Illusia_GFA_GetTextSize },
+    { 97, Illusia_GFA_GetTextWidth },
 };
 MethodsInt methodsInt[] = {
-    { 2,  Illusia_isAssetExist },
-    { 4,  Illusia_getGLOptionLinear },
-    { 24, Illusia_IntOne },
-    { 25, Illusia_IntZero },
-    { 28, Illusia_saveFile },
-    { 29, Illusia_deleteFile },
-    { 30, Illusia_isFileExist },
-    { 35, Illusia_GFA_CreateFont },
-    { 37, Illusia_GFA_SetFont },
-    { 38, Illusia_GFA_CharWidth },
-    { 39, Illusia_GFA_CharHeight },
-    { 40, Illusia_GFA_GetAscent },
-    { 41, Illusia_GFA_GetDescent },
-    { 42, Illusia_GFA_GetCurrentFont },
-    { 43, Illusia_GFA_GetColor },
-    { 44, Illusia_GFA_GetStringLength },
-    { 59, Illusia_IntZero },
-    { 60, Illusia_IntZero }, // hashCode -> 0
-    { 61, Illusia_IntZero }, // getCompany -> 0
-    { 62, Illusia_IntZero }, // getGameState -> 0
+    { 2,   Illusia_isAssetExist },
+    { 4,   Illusia_getGLOptionLinear },
+    { 24,  Illusia_IntOne },
+    { 25,  Illusia_IntZero },
+    { 28,  Illusia_saveFile },
+    { 29,  Illusia_deleteFile },
+    { 30,  Illusia_isFileExist },
+    { 35,  Illusia_GFA_CreateFont },
+    { 37,  Illusia_GFA_SetFont },
+    { 38,  Illusia_GFA_CharWidth },
+    { 39,  Illusia_GFA_CharHeight },
+    { 40,  Illusia_GFA_GetAscent },
+    { 41,  Illusia_GFA_GetDescent },
+    { 42,  Illusia_GFA_GetCurrentFont },
+    { 43,  Illusia_GFA_GetColor },
+    { 44,  Illusia_GFA_GetStringLength },
+    { 59,  Illusia_IntZero },
+    { 60,  Illusia_IntZero }, // hashCode -> 0
+    { 61,  Illusia_IntZero }, // getCompany -> 0
+    { 62,  Illusia_IntZero }, // getGameState -> 0
+    { 95,  Illusia_GFA_GetWordwrapPositionEx },
+    { 96,  Illusia_GFA_GetWordwrapPosition },
+    { 114, Illusia_IntZero }, // isOfferwallEnabled -> 0
+    { 131, Illusia_IntZero }, // GetNexusSensorXAngle
+    { 132, Illusia_IntZero }, // GetNexusSensorXInc
+    { 133, Illusia_IntZero }, // GetNexusSensorYAngle
+    { 134, Illusia_IntZero }, // GetNexusSensorYInc
 };
 MethodsLong methodsLong[] = {
     { 72, Illusia_getTotalMemory },
@@ -746,76 +920,108 @@ MethodsLong methodsLong[] = {
     { 75, Illusia_getFreeMemory },
 };
 MethodsObject methodsObject[] = {
-    { 1,  Illusia_readAssets },
-    { 3,  Illusia_readAssets },
-    { 6,  Illusia_getPhoneModel },
-    { 7,  Illusia_getAbsolueFilePath },
-    { 15, Illusia_getPhoneNumber },
-    { 16, Illusia_getMacAddress },
-    { 17, Illusia_getDeviceID },
-    { 18, Illusia_getAndroidID },
-    { 19, Illusia_getOsVersion },
-    { 20, Illusia_getDeviceType },
-    { 21, Illusia_getSimSerialNumber },
-    { 22, Illusia_getLanguage },
-    { 23, Illusia_getCarrierName },
-    { 27, Illusia_loadFile },
-    { 31, Illusia_loadFile },
-    { 49, Illusia_GFA_DrawFont },
-    { 50, Illusia_GFA_DrawText },
-    { 51, Illusia_GFA_MeasureText },
-    { 52, Illusia_GFA_GetPixels32 },
-    { 53, Illusia_GFA_GetPixels16 },
-    { 63, Illusia_getPlayerName },
-    { 64, Illusia_getPlayerName },
-    { 65, Illusia_getPlayerNumberByte },
-    { 76, Illusia_getVersion },
-    { 77, Illusia_getInetHostAddress },
-    { 78, Illusia_getGamevilLiveID },
-    { 79, Illusia_getGamevilLivePW },
+    { 1,   Illusia_readAssets },
+    { 3,   Illusia_readAssets },
+    { 6,   Illusia_getPhoneModel },
+    { 7,   Illusia_getAbsolueFilePath },
+    { 15,  Illusia_getPhoneNumber },
+    { 16,  Illusia_getMacAddress },
+    { 17,  Illusia_getDeviceID },
+    { 18,  Illusia_getAndroidID },
+    { 19,  Illusia_getOsVersion },
+    { 20,  Illusia_getDeviceType },
+    { 21,  Illusia_getSimSerialNumber },
+    { 22,  Illusia_getLanguage },
+    { 23,  Illusia_getCarrierName },
+    { 27,  Illusia_loadFile },
+    { 31,  Illusia_loadFile },
+    { 49,  Illusia_GFA_DrawFont },
+    { 50,  Illusia_GFA_DrawText },
+    { 51,  Illusia_GFA_MeasureText },
+    { 52,  Illusia_GFA_GetPixels32 },
+    { 53,  Illusia_GFA_GetPixels16 },
+    { 63,  Illusia_getPlayerName },
+    { 64,  Illusia_getPlayerName },
+    { 65,  Illusia_getPlayerNumberByte },
+    { 76,  Illusia_getVersion },
+    { 77,  Illusia_getInetHostAddress },
+    { 78,  Illusia_getGamevilLiveID },
+    { 79,  Illusia_getGamevilLivePW },
+    { 115, (void *) Illusia_IntZero }, // getGamevilGiftString -> NULL
+    { 124, Illusia_getGestureName },
 };
 MethodsShort methodsShort[] = {};
 MethodsVoid methodsVoid[] = {
-    { 5,  Illusia_SetSpeed },
-    { 8,  Illusia_OnUIStatusChange },
-    { 9,  Illusia_OnSoundPlay },
-    { 10, Illusia_OnStopSound },
-    { 11, Illusia_VoidNoop },
-    { 12, Illusia_VoidNoop },
-    { 13, Illusia_VoidNoop },
-    { 14, Illusia_VoidNoop },
-    { 26, Illusia_VoidNoop },
-    { 34, Illusia_GFA_SetTextSize },
-    { 36, Illusia_GFA_SetColor },
-    { 45, Illusia_GFA_SetString },
-    { 46, Illusia_GFA_SetStringFromUnicode },
-    { 47, Illusia_GFA_ReleaseFont },
-    { 48, Illusia_GFA_Release },
-    { 54, Illusia_VoidNoop },
-    { 55, Illusia_VoidNoop },
-    { 56, Illusia_VoidNoop },
-    { 57, Illusia_VoidNoop },
-    { 58, Illusia_VoidNoop },
-    { 66, Illusia_VoidNoop },
-    { 67, Illusia_VoidNoop },
-    { 68, Illusia_VoidNoop },
-    { 69, Illusia_VoidNoop },
-    { 70, Illusia_VoidNoop },
-    { 80, Illusia_VoidNoop },
-    { 81, Illusia_VoidNoop },
-    { 82, Illusia_VoidNoop },
-    { 83, Illusia_VoidNoop },
-    { 84, Illusia_VoidNoop },
-    { 85, Illusia_VoidNoop },
-    { 86, Illusia_VoidNoop },
-    { 87, Illusia_VoidNoop },
-    { 88, Illusia_VoidNoop },
-    { 89, Illusia_VoidNoop },
-    { 90, Illusia_VoidNoop },
-    { 91, Illusia_VoidNoop },
-    { 92, Illusia_VoidNoop },
-    { 93, Illusia_VoidNoop },
-    { 94, Illusia_OnStopSound },
+    { 5,   Illusia_SetSpeed },
+    { 8,   Illusia_OnUIStatusChange },
+    { 9,   Illusia_OnSoundPlay },
+    { 10,  Illusia_OnStopSound },
+    { 11,  Illusia_VoidNoop },
+    { 12,  Illusia_VoidNoop },
+    { 13,  Illusia_VoidNoop },
+    { 14,  Illusia_VoidNoop },
+    { 26,  Illusia_VoidNoop },
+    { 34,  Illusia_GFA_SetTextSize },
+    { 36,  Illusia_GFA_SetColor },
+    { 45,  Illusia_GFA_SetString },
+    { 46,  Illusia_GFA_SetStringFromUnicode },
+    { 47,  Illusia_GFA_ReleaseFont },
+    { 48,  Illusia_GFA_Release },
+    { 54,  Illusia_VoidNoop },
+    { 55,  Illusia_VoidNoop },
+    { 56,  Illusia_VoidNoop },
+    { 57,  Illusia_VoidNoop },
+    { 58,  Illusia_VoidNoop },
+    { 66,  Illusia_VoidNoop },
+    { 67,  Illusia_VoidNoop },
+    { 68,  Illusia_VoidNoop },
+    { 69,  Illusia_VoidNoop },
+    { 70,  Illusia_VoidNoop },
+    { 80,  Illusia_VoidNoop },
+    { 81,  Illusia_VoidNoop },
+    { 82,  Illusia_VoidNoop },
+    { 83,  Illusia_VoidNoop },
+    { 84,  Illusia_VoidNoop },
+    { 85,  Illusia_VoidNoop },
+    { 86,  Illusia_VoidNoop },
+    { 87,  Illusia_VoidNoop },
+    { 88,  Illusia_VoidNoop },
+    { 89,  Illusia_VoidNoop },
+    { 90,  Illusia_VoidNoop },
+    { 91,  Illusia_VoidNoop },
+    { 92,  Illusia_VoidNoop },
+    { 93,  Illusia_VoidNoop },
+    { 94,  Illusia_OnStopSound },
+    { 98,  Illusia_VoidNoop },
+    { 99,  Illusia_VoidNoop },
+    { 100, Illusia_VoidNoop },
+    { 101, Illusia_GFA_SetStringFromKSC5601 },
+    { 102, Illusia_VoidNoop },
+    { 103, Illusia_VoidNoop },
+    { 104, Illusia_VoidNoop },
+    { 105, Illusia_VoidNoop },
+    { 106, Illusia_VoidNoop },
+    { 107, Illusia_VoidNoop },
+    { 108, Illusia_VoidNoop },
+    { 109, Illusia_VoidNoop },
+    { 110, Illusia_VoidNoop },
+    { 111, Illusia_VoidNoop },
+    { 112, Illusia_VoidNoop },
+    { 113, Illusia_VoidNoop },
+    { 116, Illusia_VoidNoop },
+    { 117, Illusia_VoidNoop },
+    { 118, Illusia_VoidNoop },
+    { 119, Illusia_VoidNoop },
+    { 120, Illusia_VoidNoop },
+    { 121, Illusia_VoidNoop },
+    { 122, Illusia_VoidNoop },
+    { 123, Illusia_VoidNoop },
+    { 125, Illusia_VoidNoop },
+    { 126, Illusia_VoidNoop },
+    { 127, Illusia_VoidNoop },
+    { 128, Illusia_VoidNoop },
+    { 129, Illusia_VoidNoop },
+    { 130, Illusia_VoidNoop },
 };
 
 /*
