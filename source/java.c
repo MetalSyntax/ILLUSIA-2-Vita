@@ -85,20 +85,29 @@ static void (*orig_GetByteArrayRegion)(JNIEnv *, jbyteArray, jsize, jsize, jbyte
 static void (*orig_ReleaseByteArrayElements)(JNIEnv *, jbyteArray, jbyte *, jint) = NULL;
 
 static jsize Illusia_GetArrayLength_wrapper(JNIEnv *env, jarray array) {
+    if (!array) return 0;
     if (illusia_is_dalvik_array(array)) {
         return (jsize) *(uint32_t *)((char *) array + 8);
     }
-    if (orig_GetArrayLength) return orig_GetArrayLength(env, array);
-    return 0;
+    if (orig_GetArrayLength) {
+        jsize len = orig_GetArrayLength(env, array);
+        if (len > 0) return len;
+    }
+    return (jsize) strlen((const char *) array);
 }
 
 static jbyte *Illusia_GetByteArrayElements_wrapper(JNIEnv *env, jbyteArray array, jboolean *isCopy) {
+    if (!array) return NULL;
     if (illusia_is_dalvik_array(array)) {
         if (isCopy) *isCopy = JNI_FALSE;
         return (jbyte *)((char *) array + 16);
     }
-    if (orig_GetByteArrayElements) return orig_GetByteArrayElements(env, array, isCopy);
-    return NULL;
+    if (orig_GetByteArrayElements) {
+        jbyte *res = orig_GetByteArrayElements(env, array, isCopy);
+        if (res) return res;
+    }
+    if (isCopy) *isCopy = JNI_FALSE;
+    return (jbyte *) array;
 }
 
 static void Illusia_GetByteArrayRegion_wrapper(JNIEnv *env, jbyteArray array, jsize start, jsize len, jbyte *buf) {
@@ -862,6 +871,32 @@ NameToMethodID nameToMethodId[] = {
     { 141, "IsNexusSensorShakeDevice", METHOD_TYPE_BOOLEAN },
     { 142, "IsNexusSensorTopAcceleration", METHOD_TYPE_BOOLEAN },
     { 143, "IsNexusSensorTopOrientation", METHOD_TYPE_BOOLEAN },
+    { 144, "trackPageViewDispatch", METHOD_TYPE_VOID },
+    { 145, "getDeviceModel", METHOD_TYPE_OBJECT },
+    { 146, "getOldPhoneNumber", METHOD_TYPE_OBJECT },
+    { 147, "isK", METHOD_TYPE_INT },
+    { 148, "isNexusOne", METHOD_TYPE_INT },
+    { 149, "isUserAcceptC2dm", METHOD_TYPE_INT },
+    { 150, "setUserAcceptC2dm", METHOD_TYPE_VOID },
+    { 151, "saveCurrenUIStatus", METHOD_TYPE_VOID },
+    { 152, "setFrameSpeed", METHOD_TYPE_VOID },
+    { 153, "setLocalPushNotification", METHOD_TYPE_VOID },
+    { 154, "setTimeeOut", METHOD_TYPE_VOID },
+    { 155, "NexusSetBlockText", METHOD_TYPE_VOID },
+    { 156, "NexusSetEngInput", METHOD_TYPE_VOID },
+    { 157, "NexusSensorBottomOrientation", METHOD_TYPE_VOID },
+    { 158, "NexusSensorInitOrientationType", METHOD_TYPE_VOID },
+    { 159, "NexusSensorLeftOrientation", METHOD_TYPE_VOID },
+    { 160, "NexusSensorRightOrientation", METHOD_TYPE_VOID },
+    { 161, "NexusSensorTopOrientation", METHOD_TYPE_VOID },
+    { 162, "NexusTouchSetCheckGestureBuilder", METHOD_TYPE_VOID },
+    { 163, "NexusTouchSetUseCustomeGesture", METHOD_TYPE_VOID },
+    { 164, "GFA_GetStringLengthEx", METHOD_TYPE_INT },
+    { 165, "GFA_GetTextWidths", METHOD_TYPE_FLOAT },
+    { 166, "GFA_InitString", METHOD_TYPE_VOID },
+    { 167, "GFA_SetStringEx", METHOD_TYPE_VOID },
+    { 168, "getNumberFromKeyboard", METHOD_TYPE_OBJECT },
+    { 169, "getTextFromKeyboard", METHOD_TYPE_OBJECT },
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -881,8 +916,9 @@ MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
 MethodsDouble methodsDouble[] = {};
 MethodsFloat methodsFloat[] = {
-    { 71, Illusia_GFA_GetTextSize },
-    { 97, Illusia_GFA_GetTextWidth },
+    { 71,  Illusia_GFA_GetTextSize },
+    { 97,  Illusia_GFA_GetTextWidth },
+    { 165, Illusia_GFA_GetTextWidth },
 };
 MethodsInt methodsInt[] = {
     { 2,   Illusia_isAssetExist },
@@ -912,6 +948,10 @@ MethodsInt methodsInt[] = {
     { 132, Illusia_IntZero }, // GetNexusSensorXInc
     { 133, Illusia_IntZero }, // GetNexusSensorYAngle
     { 134, Illusia_IntZero }, // GetNexusSensorYInc
+    { 147, Illusia_IntZero }, // isK
+    { 148, Illusia_IntZero }, // isNexusOne
+    { 149, Illusia_IntZero }, // isUserAcceptC2dm
+    { 164, Illusia_GFA_GetStringLength },
 };
 MethodsLong methodsLong[] = {
     { 72, Illusia_getTotalMemory },
@@ -949,6 +989,10 @@ MethodsObject methodsObject[] = {
     { 79,  Illusia_getGamevilLivePW },
     { 115, (void *) Illusia_IntZero }, // getGamevilGiftString -> NULL
     { 124, Illusia_getGestureName },
+    { 145, Illusia_getPhoneModel },
+    { 146, Illusia_getPhoneNumber },
+    { 168, (void *) Illusia_IntZero },
+    { 169, (void *) Illusia_IntZero },
 };
 MethodsShort methodsShort[] = {};
 MethodsVoid methodsVoid[] = {
@@ -1022,6 +1066,23 @@ MethodsVoid methodsVoid[] = {
     { 128, Illusia_VoidNoop },
     { 129, Illusia_VoidNoop },
     { 130, Illusia_VoidNoop },
+    { 144, Illusia_VoidNoop },
+    { 150, Illusia_VoidNoop },
+    { 151, Illusia_VoidNoop },
+    { 152, Illusia_VoidNoop },
+    { 153, Illusia_VoidNoop },
+    { 154, Illusia_VoidNoop },
+    { 155, Illusia_VoidNoop },
+    { 156, Illusia_VoidNoop },
+    { 157, Illusia_VoidNoop },
+    { 158, Illusia_VoidNoop },
+    { 159, Illusia_VoidNoop },
+    { 160, Illusia_VoidNoop },
+    { 161, Illusia_VoidNoop },
+    { 162, Illusia_VoidNoop },
+    { 163, Illusia_VoidNoop },
+    { 166, Illusia_VoidNoop },
+    { 167, Illusia_GFA_SetString },
 };
 
 /*

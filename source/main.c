@@ -59,6 +59,7 @@ void (*NativeResize)(void *env, void *obj, int w, int h);
 void (*NativeResumeClet)(void *env, void *obj);
 void (*NativePauseClet)(void *env, void *obj);
 void (*NativeDestroyClet)(void *env, void *obj);
+void (*InitializeJNIGlobalRef)(void *env, void *obj);
 void (*handleCletEvent)(void *env, void *obj, int type, int p1, int p2, int p3);
 
 /* Input event definitions */
@@ -167,16 +168,20 @@ int main() {
     NativeResumeClet          = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativeResumeClet");
     NativePauseClet           = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativePauseClet");
     NativeDestroyClet         = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_NativeDestroyClet");
+    InitializeJNIGlobalRef    = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_InitializeJNIGlobalRef");
     handleCletEvent           = (void *)so_symbol(&so_mod, "Java_com_gamevil_nexus2_Natives_handleCletEvent");
 
-    game_log("[+] Symbols: JNI_OnLoad=%p InitBuffer=%p InitDevice=%p Render=%p Resize=%p Resume=%p handleClet=%p\n",
+    game_log("[+] Symbols: JNI_OnLoad=%p InitBuffer=%p InitDevice=%p Render=%p Resize=%p Resume=%p InitGlobalRef=%p handleClet=%p\n",
              (void*)Game_JNI_OnLoad, (void*)NativeInitWithBufferSize,
              (void*)NativeInitDeviceInfo, (void*)NativeRender, (void*)NativeResize,
-             (void*)NativeResumeClet, (void*)handleCletEvent);
+             (void*)NativeResumeClet, (void*)InitializeJNIGlobalRef, (void*)handleCletEvent);
 
     // 5. Secuencia de arranque del motor Gamevil Nexus2
     game_log("[*] Ejecutando JNI_OnLoad...\n");
     if (Game_JNI_OnLoad) Game_JNI_OnLoad(&jvm, NULL);
+
+    game_log("[*] Ejecutando InitializeJNIGlobalRef...\n");
+    if (InitializeJNIGlobalRef) InitializeJNIGlobalRef(jniEnv, NULL);
 
     game_log("[*] Ejecutando NativeInitWithBufferSize(%d, %d)...\n", GAME_W, GAME_H);
     if (NativeInitWithBufferSize) NativeInitWithBufferSize(jniEnv, NULL, GAME_W, GAME_H);
