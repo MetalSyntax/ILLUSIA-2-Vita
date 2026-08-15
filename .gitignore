@@ -1,0 +1,124 @@
+# ==============================================================================
+# .gitignore para Port de PS Vita (ILLUSIA 2)
+# Configurado para ignorar contenido con derechos de autor (DMCA),
+# binarios compilados, volcados de memoria y archivos temporales de compilación.
+# ==============================================================================
+
+# --- Contenido DMCA / Propietario del Juego Original (Android) ---
+*.apk
+*.xapk
+*.apks
+*.obb
+*.zip
+*.7z
+*.rar
+*.tar*
+*.so
+libgameDSO.so
+libARMPlugin.so
+
+# Carpetas de datos volcados y descompilados del APK original
+ILLUSIA-2-*/
+*extract/
+decompiled/
+glsl_dump/
+cg_dump/
+shader_cache/
+
+# Archivos de empaquetado de Android
+classes.dex
+resources.arsc
+AndroidManifest.xml
+
+# Recursos de juego propietarios (Audio / Video / Sprites / Assets)
+# (Permitir únicamente los assets del LiveArea en extras/)
+*.mp3
+*.ogg
+*.wav
+*.mid
+*.mp4
+*.bik
+ux0_data/
+data/
+
+# --- Artefactos de Build y Compilación ---
+build/
+build_*/
+cmake-build-*/
+bin/
+out/
+target/
+*.vpk
+*.elf
+*.self
+eboot.bin
+*.sfo
+param.sfo
+*.o
+*.obj
+*.d
+*.gxp
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# --- Logs, Crash Dumps y Depuración ---
+logs/
+*.log
+*.txt.log
+*.dmp
+*.psp2dmp
+psp2core*
+coredump*
+*.analysis.txt
+
+# --- Basura de Sistema Operativo y Editores ---
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+__pycache__/
+*.py[cod]
+*$py.class
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Excepciones explícitas (Archivos del port que SÍ se deben trackear) ---
+!extras/
+!extras/livearea/
+!extras/livearea/*
+!extras/cpuinfo
+!extras/meminfo
+!extras/scripts/
+!extras/scripts/*
+!source/
+!source/**
+!lib/
+!lib/falso_jni/
+!lib/falso_jni/**
+!lib/libc_bridge/
+!lib/libc_bridge/**
+!lib/so_util/
+!lib/so_util/**
+!lib/sha1/
+!lib/sha1/**
+!lib/fios/
+!lib/fios/**
+!porting_tools/
+!porting_tools/**
+!psvita-port-toolkit/
+!psvita-port-toolkit/**
+!.agents/
+!.agents/**
+!.claude/
+!.claude/**
+!CMakeLists.txt
+!build.sh
+!README.md
+!LICENSE
+!.gitignore
+psvita-port-toolkit
