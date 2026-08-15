@@ -14,6 +14,7 @@
 *.rar
 *.tar*
 *.so
+*.webp
 libgameDSO.so
 libARMPlugin.so
 
