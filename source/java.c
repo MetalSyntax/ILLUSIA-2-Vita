@@ -53,42 +53,158 @@ static int illusia_resolve_asset_path(const char *name, char *out, size_t out_si
  * FalsoJNI GetArrayLength/GetByteArrayElements, which misread our
  * malloc(16+size) layout as their own array representation and corrupted
  * memory.
+ *
+ * Backed by an open-addressing pointer hash set rather than a linear array:
+ * illusia_is_dalvik_array() is hit on every single JNI array/string call
+ * (GetByteArrayElements, GetArrayLength, GetByteArrayRegion, ...), and with
+ * readAssets() registering a fresh entry on every call (even cache hits, for
+ * correctness — see the readAssets cache below), a long session can push
+ * this into the tens of thousands of entries. A linear scan there made every
+ * later JNI call progressively slower as the count grew.
  */
-static void **g_dalvik_registry = NULL;
-static int g_dalvik_registry_count = 0;
-static int g_dalvik_registry_cap = 0;
+static void **g_dalvik_set = NULL;
+static int g_dalvik_set_cap = 0;
+static int g_dalvik_set_count = 0;
+
+static uint32_t illusia_ptr_hash(void *ptr) {
+    uintptr_t v = (uintptr_t)ptr;
+    v ^= v >> 16;
+    v *= 0x85ebca6bu;
+    v ^= v >> 13;
+    return (uint32_t)v;
+}
+
+static void illusia_dalvik_set_insert(void **table, int cap, void *ptr) {
+    uint32_t mask = (uint32_t)(cap - 1);
+    uint32_t idx = illusia_ptr_hash(ptr) & mask;
+    while (table[idx]) {
+        idx = (idx + 1) & mask;
+    }
+    table[idx] = ptr;
+}
 
 static void illusia_register_dalvik_array(void *ptr) {
-    if (g_dalvik_registry_count >= g_dalvik_registry_cap) {
-        int new_cap = g_dalvik_registry_cap ? g_dalvik_registry_cap * 2 : 1024;
-        void **grown = realloc(g_dalvik_registry, sizeof(void *) * new_cap);
+    if (!ptr) return;
+
+    if (g_dalvik_set_cap == 0 || (g_dalvik_set_count + 1) * 4 >= g_dalvik_set_cap * 3) {
+        int new_cap = g_dalvik_set_cap ? g_dalvik_set_cap * 2 : 2048;
+        void **grown = calloc(new_cap, sizeof(void *));
         if (!grown) {
-            game_log("[Java] Warning: Dalvik array registry realloc failed (cap %d)\n", g_dalvik_registry_cap);
+            game_log("[Java] Warning: Dalvik array set alloc failed (cap %d)\n", g_dalvik_set_cap);
             return;
         }
-        g_dalvik_registry = grown;
-        g_dalvik_registry_cap = new_cap;
+        for (int i = 0; i < g_dalvik_set_cap; i++) {
+            if (g_dalvik_set[i]) illusia_dalvik_set_insert(grown, new_cap, g_dalvik_set[i]);
+        }
+        free(g_dalvik_set);
+        g_dalvik_set = grown;
+        g_dalvik_set_cap = new_cap;
     }
-    g_dalvik_registry[g_dalvik_registry_count++] = ptr;
+
+    illusia_dalvik_set_insert(g_dalvik_set, g_dalvik_set_cap, ptr);
+    g_dalvik_set_count++;
 }
 
 static int illusia_is_dalvik_array(void *ptr) {
-    for (int i = 0; i < g_dalvik_registry_count; i++) {
-        if (g_dalvik_registry[i] == ptr) return 1;
+    if (!ptr || g_dalvik_set_cap == 0) return 0;
+    uint32_t mask = (uint32_t)(g_dalvik_set_cap - 1);
+    uint32_t idx = illusia_ptr_hash(ptr) & mask;
+    while (g_dalvik_set[idx]) {
+        if (g_dalvik_set[idx] == ptr) return 1;
+        idx = (idx + 1) & mask;
     }
     return 0;
+}
+
+/*
+ * readAssets() disk-read cache, keyed by resolved path.
+ * The engine re-reads the same script/table files (e.g. output_eng.zt1)
+ * dozens of times per second during dialogue-heavy scenes — each call used to
+ * fopen()+fread() the file from ux0: again, which on Vita storage is slow
+ * enough in a tight burst to look like a stall/freeze.
+ *
+ * This cache stores only the raw bytes. It must NOT hand out the same
+ * array_obj pointer twice: our GetByteArrayElements wrapper returns a direct
+ * pointer (isCopy=JNI_FALSE) into that buffer, which is a JNI-legal contract
+ * for native code to write through — some consumer decoding/decrypting a
+ * buffer in place would otherwise permanently corrupt every future "read" of
+ * that file for the rest of the process. So every readAssets() call still
+ * gets its own fresh malloc + its own g_dalvik_registry entry (matching
+ * pre-cache behavior exactly); only the disk I/O is skipped on a hit.
+ */
+typedef struct {
+    char *path;
+    void *bytes;
+    long size;
+} AssetCacheEntry;
+
+static AssetCacheEntry *g_asset_cache = NULL;
+static int g_asset_cache_count = 0;
+static int g_asset_cache_cap = 0;
+
+static AssetCacheEntry *illusia_asset_cache_find(const char *path) {
+    for (int i = 0; i < g_asset_cache_count; i++) {
+        if (strcmp(g_asset_cache[i].path, path) == 0) return &g_asset_cache[i];
+    }
+    return NULL;
+}
+
+/* Takes ownership of `owned_bytes` (caller must not free/reuse it after). */
+static void illusia_asset_cache_add(const char *path, void *owned_bytes, long size) {
+    if (g_asset_cache_count >= g_asset_cache_cap) {
+        int new_cap = g_asset_cache_cap ? g_asset_cache_cap * 2 : 256;
+        AssetCacheEntry *grown = realloc(g_asset_cache, sizeof(AssetCacheEntry) * new_cap);
+        if (!grown) { free(owned_bytes); return; }
+        g_asset_cache = grown;
+        g_asset_cache_cap = new_cap;
+    }
+    g_asset_cache[g_asset_cache_count].path = strdup(path);
+    g_asset_cache[g_asset_cache_count].bytes = owned_bytes;
+    g_asset_cache[g_asset_cache_count].size = size;
+    g_asset_cache_count++;
+}
+
+static void *illusia_get_array_payload(void *arr, int *out_len, int elem_size) {
+    if (!arr) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    if (illusia_is_dalvik_array(arr)) {
+        if (out_len) *out_len = (int)*(uint32_t *)((char *)arr + 8);
+        return (void *)((char *)arr + 16);
+    }
+    JavaDynArray *jda = jda_find(arr);
+    if (jda && jda->array) {
+        if (out_len) *out_len = jda->len;
+        return jda->array;
+    }
+    if (out_len) *out_len = 0;
+    return arr;
 }
 
 static jsize (*orig_GetArrayLength)(JNIEnv *, jarray) = NULL;
 static jbyte *(*orig_GetByteArrayElements)(JNIEnv *, jbyteArray, jboolean *) = NULL;
 static void (*orig_GetByteArrayRegion)(JNIEnv *, jbyteArray, jsize, jsize, jbyte *) = NULL;
 static void (*orig_ReleaseByteArrayElements)(JNIEnv *, jbyteArray, jbyte *, jint) = NULL;
+static const char *(*orig_GetStringUTFChars)(JNIEnv *, jstring, jboolean *) = NULL;
+static void (*orig_ReleaseStringUTFChars)(JNIEnv *, jstring, char *) = NULL;
+static jsize (*orig_GetStringUTFLength)(JNIEnv *, jstring) = NULL;
+static jsize (*orig_GetStringLength)(JNIEnv *, jstring) = NULL;
+static jfloat *(*orig_GetFloatArrayElements)(JNIEnv *, jfloatArray, jboolean *) = NULL;
+static void (*orig_GetFloatArrayRegion)(JNIEnv *, jfloatArray, jsize, jsize, jfloat *) = NULL;
+static jint *(*orig_GetIntArrayElements)(JNIEnv *, jintArray, jboolean *) = NULL;
+static void (*orig_GetIntArrayRegion)(JNIEnv *, jintArray, jsize, jsize, jint *) = NULL;
+static jshort *(*orig_GetShortArrayElements)(JNIEnv *, jshortArray, jboolean *) = NULL;
+static void (*orig_GetShortArrayRegion)(JNIEnv *, jshortArray, jsize, jsize, jshort *) = NULL;
+static jdouble *(*orig_GetDoubleArrayElements)(JNIEnv *, jdoubleArray, jboolean *) = NULL;
 
 static jsize Illusia_GetArrayLength_wrapper(JNIEnv *env, jarray array) {
     if (!array) return 0;
     if (illusia_is_dalvik_array(array)) {
         return (jsize) *(uint32_t *)((char *) array + 8);
     }
+    JavaDynArray *jda = jda_find((void *)array);
+    if (jda) return (jsize)jda->len;
     if (orig_GetArrayLength) {
         jsize len = orig_GetArrayLength(env, array);
         if (len > 0) return len;
@@ -98,21 +214,25 @@ static jsize Illusia_GetArrayLength_wrapper(JNIEnv *env, jarray array) {
 
 static jbyte *Illusia_GetByteArrayElements_wrapper(JNIEnv *env, jbyteArray array, jboolean *isCopy) {
     if (!array) return NULL;
+    if (isCopy) *isCopy = JNI_FALSE;
     if (illusia_is_dalvik_array(array)) {
-        if (isCopy) *isCopy = JNI_FALSE;
         return (jbyte *)((char *) array + 16);
     }
+    JavaDynArray *jda = jda_find((void *)array);
+    if (jda && jda->array) return (jbyte *)jda->array;
     if (orig_GetByteArrayElements) {
         jbyte *res = orig_GetByteArrayElements(env, array, isCopy);
         if (res) return res;
     }
-    if (isCopy) *isCopy = JNI_FALSE;
     return (jbyte *) array;
 }
 
 static void Illusia_GetByteArrayRegion_wrapper(JNIEnv *env, jbyteArray array, jsize start, jsize len, jbyte *buf) {
-    if (illusia_is_dalvik_array(array)) {
-        memcpy(buf, (char *) array + 16 + start, len);
+    if (!array || !buf || len <= 0) return;
+    int arr_len = 0;
+    void *payload = illusia_get_array_payload(array, &arr_len, 1);
+    if (payload) {
+        memcpy(buf, (char *)payload + start, len);
         return;
     }
     if (orig_GetByteArrayRegion) orig_GetByteArrayRegion(env, array, start, len, buf);
@@ -125,17 +245,160 @@ static void Illusia_ReleaseByteArrayElements_wrapper(JNIEnv *env, jbyteArray arr
     if (orig_ReleaseByteArrayElements) orig_ReleaseByteArrayElements(env, array, elems, mode);
 }
 
+static const char *Illusia_GetStringUTFChars_wrapper(JNIEnv *env, jstring string, jboolean *isCopy) {
+    if (!string) return NULL;
+    const char *s = (const char *)string;
+    if (illusia_is_dalvik_array(string)) {
+        s = (const char *)((char *)string + 16);
+    }
+    if (isCopy) *isCopy = JNI_TRUE;
+    return strdup(s);
+}
+
+static void Illusia_ReleaseStringUTFChars_wrapper(JNIEnv *env, jstring string, char *chars) {
+    if (chars) free(chars);
+}
+
+static jsize Illusia_GetStringUTFLength_wrapper(JNIEnv *env, jstring string) {
+    if (!string) return 0;
+    if (illusia_is_dalvik_array(string)) {
+        return (jsize)*(uint32_t *)((char *)string + 8);
+    }
+    return (jsize)strlen((const char *)string);
+}
+
+static jsize Illusia_GetStringLength_wrapper(JNIEnv *env, jstring string) {
+    return Illusia_GetStringUTFLength_wrapper(env, string);
+}
+
+static jfloat *Illusia_GetFloatArrayElements_wrapper(JNIEnv *env, jfloatArray array, jboolean *isCopy) {
+    if (!array) return NULL;
+    if (isCopy) *isCopy = JNI_FALSE;
+    if (illusia_is_dalvik_array(array)) {
+        return (jfloat *)((char *)array + 16);
+    }
+    JavaDynArray *jda = jda_find((void *)array);
+    if (jda && jda->array) return (jfloat *)jda->array;
+    if (orig_GetFloatArrayElements) {
+        jfloat *res = orig_GetFloatArrayElements(env, array, isCopy);
+        if (res) return res;
+    }
+    return (jfloat *)array;
+}
+
+static void Illusia_GetFloatArrayRegion_wrapper(JNIEnv *env, jfloatArray array, jsize start, jsize len, jfloat *buf) {
+    if (!array || !buf || len <= 0) return;
+    int arr_len = 0;
+    void *payload = illusia_get_array_payload(array, &arr_len, sizeof(jfloat));
+    if (payload) {
+        memcpy(buf, (jfloat *)payload + start, len * sizeof(jfloat));
+        return;
+    }
+    if (orig_GetFloatArrayRegion) orig_GetFloatArrayRegion(env, array, start, len, buf);
+}
+
+static jint *Illusia_GetIntArrayElements_wrapper(JNIEnv *env, jintArray array, jboolean *isCopy) {
+    if (!array) return NULL;
+    if (isCopy) *isCopy = JNI_FALSE;
+    if (illusia_is_dalvik_array(array)) {
+        return (jint *)((char *)array + 16);
+    }
+    JavaDynArray *jda = jda_find((void *)array);
+    if (jda && jda->array) return (jint *)jda->array;
+    if (orig_GetIntArrayElements) {
+        jint *res = orig_GetIntArrayElements(env, array, isCopy);
+        if (res) return res;
+    }
+    return (jint *)array;
+}
+
+static void Illusia_GetIntArrayRegion_wrapper(JNIEnv *env, jintArray array, jsize start, jsize len, jint *buf) {
+    if (!array || !buf || len <= 0) return;
+    int arr_len = 0;
+    void *payload = illusia_get_array_payload(array, &arr_len, sizeof(jint));
+    if (payload) {
+        memcpy(buf, (jint *)payload + start, len * sizeof(jint));
+        return;
+    }
+    if (orig_GetIntArrayRegion) orig_GetIntArrayRegion(env, array, start, len, buf);
+}
+
+static jshort *Illusia_GetShortArrayElements_wrapper(JNIEnv *env, jshortArray array, jboolean *isCopy) {
+    if (!array) return NULL;
+    if (isCopy) *isCopy = JNI_FALSE;
+    if (illusia_is_dalvik_array(array)) {
+        return (jshort *)((char *)array + 16);
+    }
+    JavaDynArray *jda = jda_find((void *)array);
+    if (jda && jda->array) return (jshort *)jda->array;
+    if (orig_GetShortArrayElements) {
+        jshort *res = orig_GetShortArrayElements(env, array, isCopy);
+        if (res) return res;
+    }
+    return (jshort *)array;
+}
+
+static void Illusia_GetShortArrayRegion_wrapper(JNIEnv *env, jshortArray array, jsize start, jsize len, jshort *buf) {
+    if (!array || !buf || len <= 0) return;
+    int arr_len = 0;
+    void *payload = illusia_get_array_payload(array, &arr_len, sizeof(jshort));
+    if (payload) {
+        memcpy(buf, (jshort *)payload + start, len * sizeof(jshort));
+        return;
+    }
+    if (orig_GetShortArrayRegion) orig_GetShortArrayRegion(env, array, start, len, buf);
+}
+
+static jdouble *Illusia_GetDoubleArrayElements_wrapper(JNIEnv *env, jdoubleArray array, jboolean *isCopy) {
+    if (!array) return NULL;
+    if (isCopy) *isCopy = JNI_FALSE;
+    if (illusia_is_dalvik_array(array)) {
+        return (jdouble *)((char *)array + 16);
+    }
+    JavaDynArray *jda = jda_find((void *)array);
+    if (jda && jda->array) return (jdouble *)jda->array;
+    if (orig_GetDoubleArrayElements) {
+        jdouble *res = orig_GetDoubleArrayElements(env, array, isCopy);
+        if (res) return res;
+    }
+    return (jdouble *)array;
+}
+
 void illusia_install_array_hooks(void) {
     struct JNINativeInterface *funcs = (struct JNINativeInterface *)(uintptr_t) jni;
     orig_GetArrayLength = funcs->GetArrayLength;
     orig_GetByteArrayElements = funcs->GetByteArrayElements;
     orig_GetByteArrayRegion = funcs->GetByteArrayRegion;
     orig_ReleaseByteArrayElements = funcs->ReleaseByteArrayElements;
+    orig_GetStringUTFChars = funcs->GetStringUTFChars;
+    orig_ReleaseStringUTFChars = funcs->ReleaseStringUTFChars;
+    orig_GetStringUTFLength = funcs->GetStringUTFLength;
+    orig_GetStringLength = funcs->GetStringLength;
+    orig_GetFloatArrayElements = funcs->GetFloatArrayElements;
+    orig_GetFloatArrayRegion = funcs->GetFloatArrayRegion;
+    orig_GetIntArrayElements = funcs->GetIntArrayElements;
+    orig_GetIntArrayRegion = funcs->GetIntArrayRegion;
+    orig_GetShortArrayElements = funcs->GetShortArrayElements;
+    orig_GetShortArrayRegion = funcs->GetShortArrayRegion;
+    orig_GetDoubleArrayElements = funcs->GetDoubleArrayElements;
+
     funcs->GetArrayLength = Illusia_GetArrayLength_wrapper;
     funcs->GetByteArrayElements = Illusia_GetByteArrayElements_wrapper;
     funcs->GetByteArrayRegion = Illusia_GetByteArrayRegion_wrapper;
     funcs->ReleaseByteArrayElements = Illusia_ReleaseByteArrayElements_wrapper;
-    game_log("[Java] FalsoJNI array wrappers installed.\n");
+    funcs->GetStringUTFChars = Illusia_GetStringUTFChars_wrapper;
+    funcs->ReleaseStringUTFChars = Illusia_ReleaseStringUTFChars_wrapper;
+    funcs->GetStringUTFLength = Illusia_GetStringUTFLength_wrapper;
+    funcs->GetStringLength = Illusia_GetStringLength_wrapper;
+    funcs->GetFloatArrayElements = Illusia_GetFloatArrayElements_wrapper;
+    funcs->GetFloatArrayRegion = Illusia_GetFloatArrayRegion_wrapper;
+    funcs->GetIntArrayElements = Illusia_GetIntArrayElements_wrapper;
+    funcs->GetIntArrayRegion = Illusia_GetIntArrayRegion_wrapper;
+    funcs->GetShortArrayElements = Illusia_GetShortArrayElements_wrapper;
+    funcs->GetShortArrayRegion = Illusia_GetShortArrayRegion_wrapper;
+    funcs->GetDoubleArrayElements = Illusia_GetDoubleArrayElements_wrapper;
+
+    game_log("[Java] FalsoJNI array and string wrappers installed.\n");
 }
 
 /*
@@ -157,35 +420,50 @@ jobject Illusia_readAssets(jmethodID id, va_list args) {
         return NULL;
     }
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        game_log("[Java] readAssets: failed to open %s\n", path);
-        return NULL;
-    }
+    long size;
+    const void *src;
 
-    struct stat st;
-    long size = -1;
-    if (fstat(fileno(f), &st) == 0) {
-        size = st.st_size;
-    }
+    AssetCacheEntry *cached = illusia_asset_cache_find(path);
+    if (cached) {
+        size = cached->size;
+        src = cached->bytes;
+    } else {
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            game_log("[Java] readAssets: failed to open %s\n", path);
+            return NULL;
+        }
 
-    if (size < 0 || size > 64 * 1024 * 1024) {
-        game_log("[Java] readAssets: invalid size %ld for %s\n", size, path);
+        struct stat st;
+        size = -1;
+        if (fstat(fileno(f), &st) == 0) {
+            size = st.st_size;
+        }
+
+        if (size < 0 || size > 64 * 1024 * 1024) {
+            game_log("[Java] readAssets: invalid size %ld for %s\n", size, path);
+            fclose(f);
+            return NULL;
+        }
+
+        void *disk_bytes = malloc(size);
+        if (!disk_bytes) {
+            fclose(f);
+            return NULL;
+        }
+        fread(disk_bytes, 1, size, f);
         fclose(f);
-        return NULL;
+
+        illusia_asset_cache_add(path, disk_bytes, size); /* takes ownership of disk_bytes */
+        src = disk_bytes;
     }
 
     void *array_obj = malloc(16 + size);
-    if (!array_obj) {
-        fclose(f);
-        return NULL;
-    }
+    if (!array_obj) return NULL;
 
     memset(array_obj, 0, 16);
     *(uint32_t *)((char *)array_obj + 8) = (uint32_t)size;
-
-    fread((char *) array_obj + 16, 1, size, f);
-    fclose(f);
+    memcpy((char *)array_obj + 16, src, size);
 
     illusia_register_dalvik_array(array_obj);
 
@@ -232,20 +510,31 @@ void Illusia_SetSpeed(jmethodID id, va_list args) {
     game_log("[Java] SetSpeed: %d\n", speed);
 }
 
+static jobject illusia_new_byte_array_str(const char *s) {
+    if (!s) return NULL;
+    int len = (int) strlen(s);
+    void *array_obj = malloc(16 + len + 1);
+    if (!array_obj) return NULL;
+    memset(array_obj, 0, 16);
+    *(uint32_t *)((char *)array_obj + 8) = (uint32_t)len;
+    memcpy((char *)array_obj + 16, s, len);
+    ((char *)array_obj + 16)[len] = '\0';
+    illusia_register_dalvik_array(array_obj);
+    return (jobject) array_obj;
+}
+
 jobject Illusia_getPhoneModel(jmethodID id, va_list args) {
-    return (jobject) "PlayStation Vita";
+    return illusia_new_byte_array_str("PlayStation Vita");
 }
 
 jobject Illusia_getAbsolueFilePath(jmethodID id, va_list args) {
-    return (jobject) "ux0:data/illusia2/";
-}
-
-static jobject illusia_new_byte_array_str(const char *s) {
-    int len = (int) strlen(s);
-    JavaDynArray *jda = jda_alloc(len, FIELD_TYPE_BYTE);
-    if (!jda) return NULL;
-    memcpy(jda->array, s, len);
-    return (jobject) jda;
+    /* The engine's native CGsFile/CGsEncryptFile save path (option.sav,
+     * SaveN.dat) never goes through Illusia_saveFile/loadFile — it builds
+     * its own path as getAbsolueFilePath() + "/" + filename (get_real_path()
+     * in the .so) and fopen()s that directly. Returning the illusia2 root
+     * here is what put save files there instead of games/. */
+    ensure_save_dir();
+    return illusia_new_byte_array_str(SAVE_DIR);
 }
 
 jobject Illusia_getPhoneNumber(jmethodID id, va_list args) {
@@ -542,10 +831,48 @@ jint Illusia_GFA_GetColor(jmethodID id, va_list args) {
     return (jint) g_gfa_color;
 }
 
+#include "font8x8.h"
+
 static int g_gfa_str_len = 0;
+static char g_gfa_current_string[2048] = {0};
 
 jint Illusia_GFA_GetStringLength(jmethodID id, va_list args) {
     return (jint) g_gfa_str_len;
+}
+
+static void gfa_set_raw_bytes(const uint8_t *raw, int len) {
+    if (!raw || len <= 0) {
+        g_gfa_str_len = 0;
+        g_gfa_current_string[0] = '\0';
+        return;
+    }
+
+    int is_utf16_le = (len >= 2 && raw[1] == 0 && raw[0] != 0);
+    int is_utf16_be = (len >= 2 && raw[0] == 0 && raw[1] != 0);
+
+    int out_idx = 0;
+    if (is_utf16_le) {
+        for (int i = 0; i + 1 < len && out_idx < (int)sizeof(g_gfa_current_string) - 1; i += 2) {
+            uint16_t ch = raw[i] | (raw[i + 1] << 8);
+            if (ch == 0) break;
+            g_gfa_current_string[out_idx++] = ((ch >= 0x20 && ch <= 0x7E) || ch == '\n' || ch == '\r') ? (char)ch : ' ';
+        }
+    } else if (is_utf16_be) {
+        for (int i = 0; i + 1 < len && out_idx < (int)sizeof(g_gfa_current_string) - 1; i += 2) {
+            uint16_t ch = (raw[i] << 8) | raw[i + 1];
+            if (ch == 0) break;
+            g_gfa_current_string[out_idx++] = ((ch >= 0x20 && ch <= 0x7E) || ch == '\n' || ch == '\r') ? (char)ch : ' ';
+        }
+    } else {
+        // Raw 8-bit ASCII / UTF-8
+        for (int i = 0; i < len && out_idx < (int)sizeof(g_gfa_current_string) - 1; i++) {
+            uint8_t ch = raw[i];
+            if (ch == 0) break;
+            g_gfa_current_string[out_idx++] = ((ch >= 0x20 && ch <= 0x7E) || ch == '\n' || ch == '\r') ? (char)ch : ' ';
+        }
+    }
+    g_gfa_current_string[out_idx] = '\0';
+    g_gfa_str_len = out_idx;
 }
 
 void Illusia_GFA_SetString(jmethodID id, va_list args) {
@@ -553,32 +880,122 @@ void Illusia_GFA_SetString(jmethodID id, va_list args) {
     int len = va_arg(args, int);
     const char *s = (const char *) str;
     if (s) {
+        if (illusia_is_dalvik_array(str)) {
+            s = (const char *)((char *)str + 16);
+        }
+        strncpy(g_gfa_current_string, s, sizeof(g_gfa_current_string) - 1);
+        g_gfa_current_string[sizeof(g_gfa_current_string) - 1] = '\0';
         g_gfa_str_len = len > 0 ? len : (int) strlen(s);
     } else {
-        g_gfa_str_len = len > 0 ? len : 0;
+        g_gfa_current_string[0] = '\0';
+        g_gfa_str_len = 0;
     }
 }
 
 void Illusia_GFA_SetStringFromUnicode(jmethodID id, va_list args) {
     jbyteArray arr = va_arg(args, jbyteArray);
-    if (!arr) { g_gfa_str_len = 0; return; }
-    if (illusia_is_dalvik_array(arr)) {
-        g_gfa_str_len = (*(int *)((char *)arr + 8)) / 2;
-    } else {
-        JavaDynArray *jda = (JavaDynArray *)arr;
-        g_gfa_str_len = jda->len / 2;
-    }
+    if (!arr) { g_gfa_str_len = 0; g_gfa_current_string[0] = '\0'; return; }
+    int len = 0;
+    uint8_t *raw = (uint8_t *)illusia_get_array_payload(arr, &len, 1);
+    gfa_set_raw_bytes(raw, len);
 }
 
 void Illusia_GFA_SetStringFromKSC5601(jmethodID id, va_list args) {
     jbyteArray arr = va_arg(args, jbyteArray);
-    if (!arr) { g_gfa_str_len = 0; return; }
-    if (illusia_is_dalvik_array(arr)) {
-        g_gfa_str_len = *(int *)((char *)arr + 8);
-    } else {
-        JavaDynArray *jda = (JavaDynArray *)arr;
-        g_gfa_str_len = jda->len;
+    if (!arr) { g_gfa_str_len = 0; g_gfa_current_string[0] = '\0'; return; }
+    int len = 0;
+    uint8_t *raw = (uint8_t *)illusia_get_array_payload(arr, &len, 1);
+    gfa_set_raw_bytes(raw, len);
+}
+
+static void gfa_rasterize_text(float start_x, float start_y, float max_w) {
+    if (!g_gfa_pixels32_jda || !g_gfa_pixels16_jda) return;
+
+    int buf_w = g_gfa_width > 0 ? g_gfa_width : 480;
+    int buf_h = g_gfa_height > 0 ? g_gfa_height : 320;
+    int total_pixels = buf_w * buf_h;
+
+    uint32_t *p32 = (uint32_t *)g_gfa_pixels32_jda->array;
+    uint16_t *p16 = (uint16_t *)g_gfa_pixels16_jda->array;
+
+    // Clear buffer
+    memset(p32, 0, total_pixels * sizeof(uint32_t));
+    memset(p16, 0, total_pixels * sizeof(uint16_t));
+
+    int scale = 1;
+    if (g_gfa_text_size >= 18.0f) scale = 2;
+    else if (g_gfa_text_size >= 14.0f) scale = 2;
+    else scale = 1;
+
+    uint32_t col32 = (uint32_t)g_gfa_color;
+    if ((col32 & 0xFF000000) == 0) {
+        col32 |= 0xFF000000;
     }
+    uint8_t a = (col32 >> 24) & 0xFF;
+    uint8_t r = (col32 >> 16) & 0xFF;
+    uint8_t g = (col32 >> 8) & 0xFF;
+    uint8_t b = col32 & 0xFF;
+    uint16_t col16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+    int cur_x = (int)start_x;
+    int cur_y = (int)start_y;
+    int max_x = cur_x;
+    int line_h = 8 * scale + 2;
+
+    const char *p = g_gfa_current_string;
+    while (*p) {
+        if (*p == '\n') {
+            cur_x = (int)start_x;
+            cur_y += line_h;
+            p++;
+            continue;
+        }
+        if (*p == '\r') {
+            p++;
+            continue;
+        }
+
+        uint8_t ch = (uint8_t)*p;
+        const uint8_t *glyph = (ch >= 0x20 && ch <= 0x7E) ? g_font8x8[ch - 0x20] : g_font8x8[0];
+
+        for (int row = 0; row < 8; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                if ((bits >> (7 - col)) & 1) {
+                    for (int dy = 0; dy < scale; dy++) {
+                        int py = cur_y + row * scale + dy;
+                        if (py < 0 || py >= buf_h) continue;
+                        for (int dx = 0; dx < scale; dx++) {
+                            int px = cur_x + col * scale + dx;
+                            if (px < 0 || px >= buf_w) continue;
+                            int idx = py * buf_w + px;
+                            p32[idx] = col32;
+                            p16[idx] = col16;
+                        }
+                    }
+                }
+            }
+        }
+
+        cur_x += 8 * scale;
+        if (cur_x > max_x) max_x = cur_x;
+
+        if (max_w > 0 && cur_x + 8 * scale > (int)(start_x + max_w)) {
+            cur_x = (int)start_x;
+            cur_y += line_h;
+        }
+
+        p++;
+    }
+
+    if (!g_gfa_measure_rect_jda) {
+        g_gfa_measure_rect_jda = jda_alloc(4, FIELD_TYPE_FLOAT);
+    }
+    float *f = (float *)g_gfa_measure_rect_jda->array;
+    f[0] = start_x;
+    f[1] = start_y;
+    f[2] = (float)(max_x - (int)start_x);
+    f[3] = (float)(cur_y + line_h - (int)start_y);
 }
 
 jfloat Illusia_GFA_GetTextWidth(jmethodID id, va_list args) {
@@ -587,7 +1004,9 @@ jfloat Illusia_GFA_GetTextWidth(jmethodID id, va_list args) {
     const char *s = (const char *) str;
     int count = len;
     if (count <= 0 && s) count = (int) strlen(s);
-    return (jfloat)(count * g_gfa_text_size * 0.6f);
+    if (count <= 0) count = g_gfa_str_len;
+    int scale = (g_gfa_text_size >= 14.0f) ? 2 : 1;
+    return (jfloat)(count * 8 * scale);
 }
 
 jint Illusia_GFA_GetWordwrapPositionEx(jmethodID id, va_list args) {
@@ -606,8 +1025,8 @@ jint Illusia_GFA_GetWordwrapPositionEx(jmethodID id, va_list args) {
         }
     }
 
-    int char_w = (int)(g_gfa_text_size * 0.6f);
-    if (char_w <= 0) char_w = 8;
+    int scale = (g_gfa_text_size >= 14.0f) ? 2 : 1;
+    int char_w = 8 * scale;
     int chars_per_line = (int)(maxWidth / char_w);
     if (chars_per_line <= 0) chars_per_line = 20;
 
@@ -632,8 +1051,8 @@ jint Illusia_GFA_GetWordwrapPosition(jmethodID id, va_list args) {
 
     if (g_gfa_str_len <= 0) return 0;
 
-    int char_w = (int)(g_gfa_text_size * 0.6f);
-    if (char_w <= 0) char_w = 8;
+    int scale = (g_gfa_text_size >= 14.0f) ? 2 : 1;
+    int char_w = 8 * scale;
     int chars_per_line = (int)(maxWidth / char_w);
     if (chars_per_line <= 0) chars_per_line = 20;
 
@@ -659,20 +1078,28 @@ void Illusia_GFA_Release(jmethodID id, va_list args) {
 }
 
 jobject Illusia_GFA_DrawFont(jmethodID id, va_list args) {
-    if (!g_gfa_measure_rect_jda) {
-        g_gfa_measure_rect_jda = jda_alloc(4, FIELD_TYPE_FLOAT);
-    }
-    float *f = (float *) g_gfa_measure_rect_jda->array;
-    f[0] = 0.0f; f[1] = 0.0f; f[2] = g_gfa_text_size; f[3] = g_gfa_text_size;
+    gfa_rasterize_text(0.0f, 0.0f, 0.0f);
     return (jobject) g_gfa_measure_rect_jda;
 }
 
 jobject Illusia_GFA_DrawText(jmethodID id, va_list args) {
-    return Illusia_GFA_DrawFont(id, args);
+    float x = (float) va_arg(args, double);
+    float y = (float) va_arg(args, double);
+    int align = va_arg(args, int);
+    float max_w = (float) va_arg(args, double);
+    (void) align;
+    gfa_rasterize_text(x, y, max_w);
+    return (jobject) g_gfa_measure_rect_jda;
 }
 
 jobject Illusia_GFA_MeasureText(jmethodID id, va_list args) {
-    return Illusia_GFA_DrawFont(id, args);
+    float x = (float) va_arg(args, double);
+    float y = (float) va_arg(args, double);
+    int align = va_arg(args, int);
+    float max_w = (float) va_arg(args, double);
+    (void) align;
+    gfa_rasterize_text(x, y, max_w);
+    return (jobject) g_gfa_measure_rect_jda;
 }
 
 jobject Illusia_GFA_GetPixels32(jmethodID id, va_list args) {
@@ -696,7 +1123,7 @@ jlong Illusia_getFreeMemory(jmethodID id, va_list args) {
 }
 
 jobject Illusia_getVersion(jmethodID id, va_list args) {
-    return (jobject) "1.0.3";
+    return illusia_new_byte_array_str("1.0.3");
 }
 
 jobject Illusia_getPlayerName(jmethodID id, va_list args) {
@@ -720,7 +1147,7 @@ jobject Illusia_getInetHostAddress(jmethodID id, va_list args) {
 }
 
 jobject Illusia_getGestureName(jmethodID id, va_list args) {
-    return (jobject) "GESTURE_NONE";
+    return illusia_new_byte_array_str("GESTURE_NONE");
 }
 
 /*

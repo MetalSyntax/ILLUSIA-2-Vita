@@ -83,11 +83,12 @@ typedef struct {
     int type, p1, p2, p3;
 } input_event;
 
-static input_event event_queue[32];
+#define EVENT_QUEUE_SIZE 128
+static input_event event_queue[EVENT_QUEUE_SIZE];
 static int eq_head = 0, eq_tail = 0;
 
 static void queue_input_event(int type, int p1, int p2, int p3) {
-    int next = (eq_tail + 1) % 32;
+    int next = (eq_tail + 1) % EVENT_QUEUE_SIZE;
     if (next != eq_head) {
         event_queue[eq_tail].type = type;
         event_queue[eq_tail].p1 = p1;
@@ -148,6 +149,10 @@ int main() {
     so_flush_caches(&so_mod);
     so_initialize(&so_mod);
     game_log("[+] Modulo inicializado.\n");
+
+    so_patch();
+    so_flush_caches(&so_mod);
+    game_log("[+] Parches aplicados y caches limpiadas.\n");
 
     // 3. Inicializar graficos y FalsoJNI
     gl_init_illusia();
@@ -257,9 +262,9 @@ int main() {
         }
 
         // Procesar cola de eventos antes del render
-        if (handleCletEvent && eq_head != eq_tail) {
+        while (handleCletEvent && eq_head != eq_tail) {
             input_event *ev = &event_queue[eq_head];
-            eq_head = (eq_head + 1) % 32;
+            eq_head = (eq_head + 1) % EVENT_QUEUE_SIZE;
             handleCletEvent(jniEnv, NULL, ev->type, ev->p1, ev->p2, ev->p3);
         }
 

@@ -168,7 +168,20 @@ void audio_init(void) {
     game_log("[Audio] Sistema de audio inicializado.\n");
 }
 
+static int current_bgm_id = -1;
+
 void audio_play(int snd_id, int vol, int is_loop) {
+    int is_bgm = (is_loop || snd_id >= 100);
+
+    // If BGM is already playing the exact same track, just update volume smoothly
+    if (is_bgm && snd_id == current_bgm_id && voices[VOICE_BGM].active) {
+        sceKernelLockMutex(audio_mutex, 1, NULL);
+        voices[VOICE_BGM].gain = (vol <= 0) ? 1.0f : ((float) vol / 80.0f);
+        if (voices[VOICE_BGM].gain > 1.0f) voices[VOICE_BGM].gain = 1.0f;
+        sceKernelUnlockMutex(audio_mutex, 1);
+        return;
+    }
+
     char path[256];
     if (!audio_resolve_path(snd_id, path, sizeof(path))) {
         return;
@@ -190,8 +203,9 @@ void audio_play(int snd_id, int vol, int is_loop) {
     }
 
     int target_slot;
-    if (is_loop || snd_id >= 100) {
+    if (is_bgm) {
         target_slot = VOICE_BGM;
+        current_bgm_id = snd_id;
     } else {
         static int sfx_rr = 0;
         target_slot = VOICE_SFX0 + (sfx_rr++ % (NUM_VOICES - VOICE_SFX0));
@@ -203,7 +217,7 @@ void audio_play(int snd_id, int vol, int is_loop) {
 
     v->vf = vf;
     v->active = 1;
-    v->loop = (is_loop || snd_id >= 100);
+    v->loop = is_bgm;
     v->channels = vi->channels;
     v->rate = vi->rate;
     v->gain = (vol <= 0) ? 1.0f : ((float) vol / 80.0f);
@@ -218,6 +232,7 @@ void audio_play(int snd_id, int vol, int is_loop) {
 void audio_stop_all(void) {
     if (audio_mutex < 0) return;
     sceKernelLockMutex(audio_mutex, 1, NULL);
+    current_bgm_id = -1;
     for (int i = 0; i < NUM_VOICES; i++) {
         voice_close(&voices[i]);
     }

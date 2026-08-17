@@ -116,10 +116,11 @@ __pycache__/
 !.agents/
 !.agents/**
 !.claude/
-!.claude/**
+!crash_tools/
+!crash_tools/**
 !CMakeLists.txt
 !build.sh
 !README.md
 !LICENSE
+!PORTING_PLAN.md
 !.gitignore
-psvita-port-toolkit
