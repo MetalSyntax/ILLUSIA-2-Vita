@@ -77,16 +77,16 @@ static uint8_t *get_main_tile_data(void *map) {
     if (!map) return NULL;
     void *layers = *(void **)((char *)map + 0xf0);
     if (!layers) return NULL;
-    int layer_count = *(int *)((char *)map + 0xd8);
-    // Prefer layer 1 (typical collision layer for foreground) over layer 0
-    if (layer_count > 1) {
-        uint8_t *l1 = *(uint8_t **)((char *)layers + 24 + 12);
-        if (l1 && (uintptr_t)l1 >= 0x10000) return l1;
-    }
-    if (layer_count > 0) {
-        uint8_t *l0 = *(uint8_t **)((char *)layers + 12);
-        if (l0 && (uintptr_t)l0 >= 0x10000) return l0;
-    }
+    /* Real ARM disassembly of CMvObject::GetMapAttrib, CMvObject::GetTileAttr
+     * (FUN_000b31ec) and CMvMapObject::GetTileAttribute (FUN_000cc128) all
+     * unconditionally read the tile-attribute array from `layers + 0xc`
+     * (layer 0) — none of them ever look at layer_count or index into a
+     * second layer at `layers + 24 + 12`. A previous "prefer layer 1"
+     * heuristic here had no basis in the real code and fed movement/
+     * collision queries the wrong layer's data for any map with more than
+     * one layer, making terrain read as solid. Always use layer 0. */
+    uint8_t *l0 = *(uint8_t **)((char *)layers + 12);
+    if (l0 && (uintptr_t)l0 >= 0x10000) return l0;
     return NULL;
 }
 
@@ -143,9 +143,8 @@ static uint8_t *swap_dummy_tile_data(void) {
     char *map = (char *)*pMapSingleton;
     void *layers = *(void **)(map + 0xf0);
     if (!layers || (uintptr_t)layers < 0x10000) return (uint8_t *)-1;
+    /* Layer 0 only — see get_main_tile_data() for why. */
     uint8_t **pTileData = (uint8_t **)((char *)layers + 12);
-    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
-    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
 
     if (*pTileData) return NULL;
 
@@ -173,8 +172,6 @@ static void restore_dummy_tile_data(uint8_t *dummy_ptr) {
     void *layers = *(void **)(map + 0xf0);
     if (!layers) return;
     uint8_t **pTileData = (uint8_t **)((char *)layers + 12);
-    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
-    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
     if (*pTileData == dummy_ptr) *pTileData = NULL;
 }
 
