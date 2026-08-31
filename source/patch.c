@@ -102,6 +102,8 @@ static so_hook hook_load_tile_image;
 static so_hook hook_objmgr_draw;
 static so_hook hook_is_drawable;
 static so_hook hook_check_rect_in_screen;
+static so_hook hook_encryptfile_loadbegin;
+static so_hook hook_invaliddata_popup;
 
 static void *(*MC_grpCreateOffScreenFrameBuffer)(int w, int h) = NULL;
 static uint16_t (*MC_grpGetPixelFromRGB)(uint8_t r, uint8_t g, uint8_t b) = NULL;
@@ -1253,6 +1255,54 @@ static int hooked_CheckRectInScreen(void *self, TGXRECT8 rect, int a, int b) {
 }
 
 /*
+ * Diagnostic hooks for the "Abnormal save file. You need to create a new
+ * character." popup reported by the user. Confirmed via
+ * decompiled/libgameDSO_armeabi/ghidra/out_ghidra.c (CMvGameState::LoadGameData,
+ * ~line 96670) and the exact string (decompressed from
+ * assets/data/Eng/StrPopup.zt1: "Abnormal save file. You need to create a new
+ * character.") that this popup is NOT a raw file-corruption/decrypt failure --
+ * it fires from a completely separate branch than that. LoadGameData's real
+ * control flow:
+ *   1. CGsEncryptFile::LoadBegin() decrypts the file and checks a 4-byte
+ *      stored-size-vs-actual-size header AND a checksum (CulCheckSum). If
+ *      EITHER check fails, LoadBegin returns false and LoadGameData returns
+ *      silently -- no popup at all is shown for a genuinely corrupt/truncated
+ *      file on disk.
+ *   2. If LoadBegin succeeds, LoadGameData then compares a value derived from
+ *      the just-loaded player data (this+0x38, XORed byte-wise) against a
+ *      per-slot summary BYTE cached in the CMvSystemMenu singleton
+ *      (ms_pSingleton + slot*0x3c + 0x4c), plus a <= check against another
+ *      cached byte (+0x52) vs the loaded player's own field (+0x2eb). ONLY
+ *      if this second, completely different comparison fails does it call
+ *      CMvSystemMenu::CreateInvalidDataPopup() -- the exact popup reported.
+ * These two hooks are pure passthroughs (no behavior change) that log which
+ * of the two independent failure modes is actually happening, instead of
+ * guessing: a LoadBegin failure means the file itself is stale/corrupt on
+ * disk (delete it and start a new save); CreateInvalidDataPopup firing means
+ * the file decrypted fine but CMvSystemMenu's cached per-slot summary is out
+ * of sync with it (a port-side persistence bug, not a corrupt save).
+ */
+static int loadbegin_log_count = 0;
+#define LOADBEGIN_LOG_MAX 30
+
+static int hooked_CGsEncryptFile_LoadBegin(void *self, const char *filename, int check_phone) {
+    int result = SO_CONTINUE(int, hook_encryptfile_loadbegin, self, filename, check_phone);
+    if (loadbegin_log_count < LOADBEGIN_LOG_MAX) {
+        loadbegin_log_count++;
+        game_log("[SaveLoad] CGsEncryptFile::LoadBegin(\"%s\") -> %s\n",
+            filename ? filename : "(null)", result ? "OK (size+checksum matched)" : "FAILED (size/checksum mismatch -- file is stale/corrupt on disk)");
+    }
+    return result;
+}
+
+static void hooked_CMvSystemMenu_CreateInvalidDataPopup(void *self) {
+    game_log("[SaveLoad] CMvSystemMenu::CreateInvalidDataPopup() fired -- file decrypted OK, "
+             "but CMvSystemMenu's cached per-slot summary doesn't match it (THIS is the "
+             "'Abnormal save file' popup)\n");
+    SO_CONTINUE_VOID(hook_invaliddata_popup, self);
+}
+
+/*
  * Hook for CMvGameScript::Script_Char_Talk()
  * _ZN13CMvGameScript16Script_Char_TalkEP7sScript
  */
@@ -1940,6 +1990,18 @@ void so_patch(void) {
     if (check_rect) {
         hook_check_rect_in_screen = hook_thumb(check_rect | 1, (uintptr_t)&hooked_CheckRectInScreen);
         game_log("[Patch] Hooked CGsGraphics::CheckRectInScreen (0x%08X)\n", (unsigned int)check_rect);
+    }
+
+    uintptr_t encryptfile_loadbegin = (uintptr_t)so_symbol(&so_mod, "_ZN14CGsEncryptFile9LoadBeginEPKcb");
+    if (encryptfile_loadbegin) {
+        hook_encryptfile_loadbegin = hook_thumb(encryptfile_loadbegin | 1, (uintptr_t)&hooked_CGsEncryptFile_LoadBegin);
+        game_log("[Patch] Hooked CGsEncryptFile::LoadBegin (0x%08X)\n", (unsigned int)encryptfile_loadbegin);
+    }
+
+    uintptr_t invaliddata_popup = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvSystemMenu22CreateInvalidDataPopupEv");
+    if (invaliddata_popup) {
+        hook_invaliddata_popup = hook_thumb(invaliddata_popup | 1, (uintptr_t)&hooked_CMvSystemMenu_CreateInvalidDataPopup);
+        game_log("[Patch] Hooked CMvSystemMenu::CreateInvalidDataPopup (0x%08X)\n", (unsigned int)invaliddata_popup);
     }
 
     uintptr_t char_talk = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript16Script_Char_TalkEP7sScript");
