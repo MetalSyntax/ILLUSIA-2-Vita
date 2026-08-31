@@ -171,10 +171,34 @@ void audio_init(void) {
 static int current_bgm_id = -1;
 
 void audio_play(int snd_id, int vol, int is_loop) {
-    int is_bgm = (is_loop || snd_id >= 100);
+    /* Real engine sends OnSoundPlay(id, vol=0, isLoop=true) as a dedicated
+     * "stop the BGM" signal, not a request to play anything -- confirmed in
+     * decompiled/apk_jadx/sources/.../SkeletonUIControllerView.java:
+     *   if (i2 == 0 && z) { NexusSound.stopBGMSound(); return; }
+     * Without this, the old code fell through and started a new "BGM" voice
+     * at gain=1.0 (vol<=0 defaults to full volume), i.e. the stop signal
+     * played something loudly instead of silencing it. */
+    if (vol == 0 && is_loop) {
+        sceKernelLockMutex(audio_mutex, 1, NULL);
+        voice_close(&voices[VOICE_BGM]);
+        current_bgm_id = -1;
+        sceKernelUnlockMutex(audio_mutex, 1);
+        return;
+    }
 
-    // If BGM is already playing the exact same track, just update volume smoothly
-    if (is_bgm && snd_id == current_bgm_id && voices[VOICE_BGM].active) {
+    /* Routing mirrors the real engine's split (same file): ids 1-9 always go
+     * through NexusSound.playSFXSound() (short one-shot SFX); id 0 or any id
+     * > 9 go through NexusSound.playSound(id, isLoop). Looping is controlled
+     * ENTIRELY by the isLoop flag the engine passes -- never by the id
+     * itself. The previous `is_loop || snd_id >= 100` condition invented an
+     * id-based looping rule with no basis in the real game: any one-shot
+     * (isLoop=false) sound with id >= 100 got routed to the single BGM voice
+     * AND had its loop flag forced to 1, so it played forever instead of
+     * once -- a non-ambient sound stuck looping. */
+    int is_main_track = (snd_id == 0 || snd_id > 9);
+
+    // If the main track is already playing the exact same track, just update volume smoothly
+    if (is_main_track && snd_id == current_bgm_id && voices[VOICE_BGM].active) {
         sceKernelLockMutex(audio_mutex, 1, NULL);
         voices[VOICE_BGM].gain = (vol <= 0) ? 1.0f : ((float) vol / 80.0f);
         if (voices[VOICE_BGM].gain > 1.0f) voices[VOICE_BGM].gain = 1.0f;
@@ -203,7 +227,7 @@ void audio_play(int snd_id, int vol, int is_loop) {
     }
 
     int target_slot;
-    if (is_bgm) {
+    if (is_main_track) {
         target_slot = VOICE_BGM;
         current_bgm_id = snd_id;
     } else {
@@ -217,7 +241,7 @@ void audio_play(int snd_id, int vol, int is_loop) {
 
     v->vf = vf;
     v->active = 1;
-    v->loop = is_bgm;
+    v->loop = is_loop;
     v->channels = vi->channels;
     v->rate = vi->rate;
     v->gain = (vol <= 0) ? 1.0f : ((float) vol / 80.0f);
