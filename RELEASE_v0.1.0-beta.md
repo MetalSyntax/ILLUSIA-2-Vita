@@ -1,21 +1,21 @@
 # ILLUSIA 2 (PS Vita) — v0.1.0-beta
 
-Primera build **beta** jugable del port de ILLUSIA 2 a PS Vita: arranca sin crashes, carga terreno/NPCs/personaje en el mapa principal, guarda partida en la ruta correcta y corre gráficos/input/audio a través de los wrappers nativos (vitaGL, FalsoJNI, Tremor). Sigue en **beta** porque hay bugs de colisión y cinemáticas todavía por confirmar en consola física.
+First playable **beta** build of the ILLUSIA 2 PS Vita port: boots without crashing, loads terrain/NPCs/player on the main map, saves to the correct location, and runs graphics/input/audio through the native wrappers (vitaGL, FalsoJNI, Tremor). It's still **beta** because collision and cutscene bugs remain to be confirmed on physical hardware.
 
-## ✅ Qué funciona
-- Arranque completo: Title → Menú Principal → Cinemáticas → In-game, sin crashes de arranque.
-- Gráficos vía vitaGL, input táctil + botones físicos (D-Pad, X/O/□/Δ, L/R, stick analógico) e input mapeado al HAL de Nexus2/Illusia.
-- Audio: mezclador multicanal en hilo dedicado (`Tremor`/`libvorbisidec`) con BGM en loop y 4 voces SFX simultáneas vía `SceAudioOut`.
-- Terreno, NPCs y personaje se cargan y renderizan correctamente en el mapa principal (fix del bug de `PreLoad` + allocator `calloc` + offset de colisión).
-- Guardado de partida en `ux0:data/illusia2/saves/` (antes escribía en la raíz de la Vita y fallaba por permisos).
-- LiveArea (`icon0`/`bg0`/`pic0`/`startup`) y empaquetado VPK completos.
+## ✅ What works
+- Full boot flow: Title → Main Menu → Cutscenes → In-game, no startup crashes.
+- Graphics via vitaGL, touch input + physical buttons (D-Pad, X/O/□/Δ, L/R, analog stick), input mapped to the Nexus2/Illusia HAL.
+- Audio: multi-channel mixer on a dedicated thread (`Tremor`/`libvorbisidec`) with looping BGM and 4 simultaneous SFX voices via `SceAudioOut`.
+- Terrain, NPCs, and the player character now load and render correctly on the main map (fix for the `PreLoad` bug + `calloc`-based allocator + collision offset fix).
+- Save games now write to `ux0:data/illusia2/saves/` (previously wrote to the Vita's root and failed due to permissions).
+- LiveArea (`icon0`/`bg0`/`pic0`/`startup`) and VPK packaging complete.
 
-## 🐛 Bugs conocidos (por qué sigue siendo beta)
-- **Colisión de terreno** (fix recién aplicado, aún no confirmado en consola): se corrigió una lectura de la capa equivocada del array de colisión (`tileData`) que hacía que el personaje atravesara plataformas o quedara atascado contra terreno que no debía ser sólido.
-- **Posicionamiento en cinemáticas**: algunos objetos/personajes en escenas con fondo de desplazamiento (ScrollBG, mapas sin datos de colisión propios) pueden aparecer fuera de posición o fuera de pantalla.
-- Posible inestabilidad puntual en transiciones entre cinemática y mapa normal, aún bajo investigación activa.
+## 🐛 Known bugs (why this is still beta)
+- **Terrain collision** (fix just applied, not yet confirmed on console): fixed a read from the wrong collision-array (`tileData`) layer that let the player walk through platforms or get stuck against terrain that shouldn't have been solid.
+- **Cutscene positioning**: some objects/characters in scrolling-background scenes (ScrollBG, maps with no collision data of their own) can appear out of position or off-screen.
+- Possible occasional instability during transitions between cutscenes and the normal map, still under active investigation.
 
-## Notas
-Build sin probar en hardware físico más allá de la sesión de logs que motivó estos fixes — se recomienda reportar cualquier crash o comportamiento raro con el log correspondiente (`ux0:data/illusia2/logs/`) para seguir iterando.
+## Notes
+This build hasn't been tested on physical hardware beyond the log session that prompted these fixes — please report any crash or odd behavior along with the matching log (`ux0:data/illusia2/logs/`) so work can keep iterating.
 
 **Commit**: `68db1db`
