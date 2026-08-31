@@ -124,3 +124,9 @@ __pycache__/
 !LICENSE
 !PORTING_PLAN.md
 !.gitignore
+screen*.png
+._*
+scripts
+screenshots
+screenshot
+crash_tools

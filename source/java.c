@@ -9,6 +9,10 @@
 #include <falso_jni/FalsoJNI.h>
 
 #include <stdio.h>
+
+#include <psp2/apputil.h>
+#include <psp2/system_param.h>
+
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -21,8 +25,8 @@
 // UI status reported by engine via OnUIStatusChange
 volatile int g_ui_status = -1;
 
-#define SAVE_DIR  "ux0:data/illusia2/games"
-#define SAVE_DIR2 "ux0:data/illusia2/saves"
+#define SAVE_DIR  "ux0:data/illusia2/saves"
+#define SAVE_DIR2 "ux0:data/illusia2/games"
 
 static void ensure_save_dir(void) {
     sceIoMkdir("ux0:data/illusia2", 0777);
@@ -528,13 +532,9 @@ jobject Illusia_getPhoneModel(jmethodID id, va_list args) {
 }
 
 jobject Illusia_getAbsolueFilePath(jmethodID id, va_list args) {
-    /* The engine's native CGsFile/CGsEncryptFile save path (option.sav,
-     * SaveN.dat) never goes through Illusia_saveFile/loadFile — it builds
-     * its own path as getAbsolueFilePath() + "/" + filename (get_real_path()
-     * in the .so) and fopen()s that directly. Returning the illusia2 root
-     * here is what put save files there instead of games/. */
+    /* The engine expects a jstring, which FalsoJNI treats as a raw char* */
     ensure_save_dir();
-    return illusia_new_byte_array_str(SAVE_DIR);
+    return (jobject)SAVE_DIR;
 }
 
 jobject Illusia_getPhoneNumber(jmethodID id, va_list args) {
@@ -1123,11 +1123,11 @@ jlong Illusia_getFreeMemory(jmethodID id, va_list args) {
 }
 
 jobject Illusia_getVersion(jmethodID id, va_list args) {
-    return illusia_new_byte_array_str("1.0.3");
+    return (jobject)"1.0.3";
 }
 
 jobject Illusia_getPlayerName(jmethodID id, va_list args) {
-    return illusia_new_byte_array_str("Hero");
+    return (jobject)"Hero";
 }
 
 jobject Illusia_getPlayerNumberByte(jmethodID id, va_list args) {
@@ -1436,6 +1436,32 @@ MethodsObject methodsObject[] = {
     { 169, (void *) Illusia_IntZero },
 };
 MethodsShort methodsShort[] = {};
+
+extern void (*handleCletEvent)(void *env, void *obj, int type, int p1, int p2, int p3);
+
+void Illusia_GetLanguage(jmethodID id, va_list args) {
+    int system_language = SCE_SYSTEM_PARAM_LANG_ENGLISH_US;
+    sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, &system_language);
+    
+    int game_lang = 1; // English
+    switch (system_language) {
+        case SCE_SYSTEM_PARAM_LANG_KOREAN:
+            game_lang = 0;
+            break;
+        case SCE_SYSTEM_PARAM_LANG_JAPANESE:
+            game_lang = 2;
+            break;
+        default:
+            game_lang = 1;
+            break;
+    }
+    
+    l_debug("[Java] GetLanguage requested! Responding with lang_id = %d", game_lang);
+    if (handleCletEvent) {
+        handleCletEvent((void *)1, NULL, 5001, game_lang, 0, 0); // 5001 is GET_LANGUAGE in Nexus2
+    }
+}
+
 MethodsVoid methodsVoid[] = {
     { 5,   Illusia_SetSpeed },
     { 8,   Illusia_OnUIStatusChange },
@@ -1445,7 +1471,7 @@ MethodsVoid methodsVoid[] = {
     { 12,  Illusia_VoidNoop },
     { 13,  Illusia_VoidNoop },
     { 14,  Illusia_VoidNoop },
-    { 22,  Illusia_VoidNoop }, // GetLanguage
+    { 22,  Illusia_GetLanguage }, // GetLanguage
     { 26,  Illusia_VoidNoop },
     { 34,  Illusia_GFA_SetTextSize },
     { 36,  Illusia_GFA_SetColor },

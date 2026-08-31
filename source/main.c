@@ -32,6 +32,27 @@
 #include "utils/dialog.h"
 #include "audio.h"
 
+/*
+ * ILLUSIA2's own Activity subclass (SkeletonLauncher.onCreate(), decompiled
+ * Java) hardcodes gameScreenWidth=480; gameScreenHeight=320 unconditionally
+ * -- NOT derived from DisplayMetrics. NexusGLRenderer then calls:
+ *   surfaceCreated:  NativeInitWithBufferSize(gameScreenWidth, gameScreenHeight)   -> 480x320, fixed
+ *   surfaceChanged:  NativeInitDeviceInfo(gameScreenWidth, gameScreenHeight)       -> 480x320, fixed
+ *                    NativeResize(realSurfaceWidth, realSurfaceHeight)             -> real device size
+ * So the engine's internal software framebuffer (everything CMvMap/CMvLayer/
+ * CGsGraphics draws into, all of which use hardcoded 0x1e0/0x140 = 480/320
+ * bounds) is ALWAYS 480x320; only the final GL viewport/ortho (NativeResize)
+ * is set to the real screen size, which is what stretches that 480x320
+ * software-rendered image to fill the whole display. Sizing the internal
+ * framebuffer to the Vita's real 960x544 panel (a prior fix here, based on
+ * a misreading of NexusGLRenderer alone without checking SkeletonLauncher)
+ * left the game drawing only into the top-left 480x320 corner of a larger
+ * buffer that then got displayed 1:1 -- i.e. exactly "only see 480x320 of
+ * the screen". Likewise UIFullTouch.convertScreenX/Y (decompiled Java)
+ * rescales real touch coordinates into the fixed 480x320 game space before
+ * calling native -- so touch input must scale to GAME_W/GAME_H, not
+ * SCREEN_W/SCREEN_H.
+ */
 #define GAME_W 480
 #define GAME_H 320
 #define SCREEN_W 960
@@ -48,6 +69,7 @@ so_module so_mod;
 extern so_default_dynlib default_dynlib[];
 extern void resolve_imports(so_module* mod);
 extern void illusia_install_array_hooks(void);
+extern void gl_frame_tick(void);
 extern volatile int g_ui_status;
 
 /* Native JNI function pointers */
@@ -243,7 +265,9 @@ int main() {
         }
         old_buttons = cur_buttons;
 
-        // Mapeo táctil al espacio lógico GAME_W x GAME_H (480x320)
+        // Mapeo táctil al espacio lógico del juego GAME_W x GAME_H (480x320):
+        // UIFullTouch.convertScreenX/Y (Java decompilado) hace exactamente este
+        // escalado (gameScreenWidth * x / realWidth) antes de llamar a nativo.
         if (touch.reportNum > 0) {
             int x = touch.report[0].x * GAME_W / 1920;
             int y = touch.report[0].y * GAME_H / 1088;
@@ -277,6 +301,7 @@ int main() {
         }
 
         vglSwapBuffers(GL_FALSE);
+        gl_frame_tick();
     }
 
     if (NativePauseClet) NativePauseClet(jniEnv, NULL);

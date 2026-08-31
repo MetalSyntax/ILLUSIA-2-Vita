@@ -123,6 +123,94 @@ extern const short *BIONIC_toupper_tab_;
 
 static FILE __sF_fake[3];
 
+/*
+ * Verbose GL-level frame tracer (2026-08-30).
+ *
+ * Rather than keep reverse-engineering one Nexus2 engine function at a time
+ * to explain "missing terrain/player/NPCs" and "scenes render completely
+ * black" reports, these thin wrappers sit directly on the .so's real GL/EGL
+ * imports (already resolved to real vitaGL/EGL symbols below -- this just
+ * redirects a handful of those import-table entries through a counting
+ * shim first) so every session log carries ground-truth, per-frame GPU
+ * submission data for free, no per-bug hook needed: how many draw calls
+ * happened, how many vertices/indices they covered, whether glClear ran and
+ * to what color, and what the last bound texture was. This directly answers
+ * "did the engine even try to draw anything this frame" (a true `draws=0`
+ * frame is undeniable evidence of nothing being submitted -- e.g. explains
+ * a fully black interior scene) versus "it drew things but they're not
+ * visible" (draws>0 but still black/missing on screen -- points at
+ * texture/blend/position state instead, a different bug class entirely).
+ * Rate-limited to one line whenever a frame has zero draw calls (always,
+ * uncapped -- this should be rare and is the most interesting case) plus a
+ * periodic heartbeat every 300 frames (~5s) so normal frames are visible
+ * for comparison too. Pure passthrough, no rendering behavior change.
+ */
+static uint32_t gl_frame_draw_calls = 0;
+static uint32_t gl_frame_vertex_count = 0;
+static uint32_t gl_frame_clear_calls = 0;
+static uint32_t gl_frame_counter = 0;
+static uint32_t gl_last_bound_texture = 0;
+static float gl_last_clear_color[4] = { -1, -1, -1, -1 };
+
+static void hooked_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    gl_frame_draw_calls++;
+    gl_frame_vertex_count += (count > 0) ? (uint32_t)count : 0;
+    glDrawArrays(mode, first, count);
+}
+
+static void hooked_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
+    gl_frame_draw_calls++;
+    gl_frame_vertex_count += (count > 0) ? (uint32_t)count : 0;
+    glDrawElements(mode, count, type, indices);
+}
+
+static void hooked_glClear(GLbitfield mask) {
+    gl_frame_clear_calls++;
+    glClear(mask);
+}
+
+static void hooked_glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
+    gl_last_clear_color[0] = red;
+    gl_last_clear_color[1] = green;
+    gl_last_clear_color[2] = blue;
+    gl_last_clear_color[3] = alpha;
+    glClearColor(red, green, blue, alpha);
+}
+
+static void hooked_glBindTexture(GLenum target, GLuint texture) {
+    gl_last_bound_texture = texture;
+    glBindTexture(target, texture);
+}
+
+/*
+ * Frame-boundary tick: logs and resets the per-frame GL counters above.
+ *
+ * CORRECTION (game_047.log): zero [GLFrame] lines appeared in an entire
+ * ~1800-frame session -- this loader's own render loop (source/main.c) calls
+ * `vglSwapBuffers(GL_FALSE)` directly to present each frame, it does NOT go
+ * through the .so's `eglSwapBuffers` import at all, so hooked_eglSwapBuffers
+ * below was simply never invoked. Exposed here so main.c can call it right
+ * after its own vglSwapBuffers instead.
+ */
+void gl_frame_tick(void) {
+    gl_frame_counter++;
+    if (gl_frame_draw_calls == 0 || (gl_frame_counter % 300) == 0) {
+        game_log("[GLFrame] frame=%u draws=%u vertices=%u clears=%u clearColor=(%.2f,%.2f,%.2f,%.2f) lastTex=%u\n",
+            gl_frame_counter, gl_frame_draw_calls, gl_frame_vertex_count, gl_frame_clear_calls,
+            gl_last_clear_color[0], gl_last_clear_color[1], gl_last_clear_color[2], gl_last_clear_color[3],
+            gl_last_bound_texture);
+    }
+    gl_frame_draw_calls = 0;
+    gl_frame_vertex_count = 0;
+    gl_frame_clear_calls = 0;
+}
+
+static EGLBoolean hooked_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
+    /* Kept in case some code path ever does call this; harmless no-op tick
+     * if main.c's own gl_frame_tick() already handled this frame. */
+    return eglSwapBuffers(display, surface);
+}
+
 void *dlsym_soloader(void * handle, const char * symbol) {
     // Usage example:
     // if (strcmp("AMotionEvent_getAxisValue", symbol) == 0)
@@ -130,6 +218,51 @@ void *dlsym_soloader(void * handle, const char * symbol) {
 
     l_error("dlsym: Unknown symbol \"%s\".", symbol);
     return NULL;
+}
+
+#define SUSPICIOUS_PTR_THRESHOLD 0x10000u
+
+void *custom_memcpy(void *dest, const void *src, size_t n) {
+    if (n != 0 && ((uintptr_t) dest < SUSPICIOUS_PTR_THRESHOLD ||
+                   (uintptr_t) src < SUSPICIOUS_PTR_THRESHOLD)) {
+        return dest;
+    }
+
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
+
+    if (d < s) {
+        while (n--)
+            *d++ = *s++;
+    } else {
+        d += n;
+        s += n;
+        while (n--)
+            *--d = *--s;
+    }
+    return dest;
+}
+
+void *custom_memmove(void *dest, const void *src, size_t n) {
+    return custom_memcpy(dest, src, n);
+}
+
+void *custom_memset(void *s, int c, size_t n) {
+    if (n != 0 && (uintptr_t) s < SUSPICIOUS_PTR_THRESHOLD) {
+        return s;
+    }
+    uint8_t *p = (uint8_t *)s;
+    while (n--)
+        *p++ = (uint8_t)c;
+    return s;
+}
+
+void custom_aeabi_memclr(void *dest, size_t n) {
+    custom_memset(dest, 0, n);
+}
+
+void custom_aeabi_memset(void *dest, size_t n, int c) {
+    custom_memset(dest, c, n);
 }
 
 so_default_dynlib default_dynlib[] = {
@@ -163,18 +296,18 @@ so_default_dynlib default_dynlib[] = {
         { "__aeabi_l2d", (uintptr_t)&__aeabi_l2d },
         { "__aeabi_l2f", (uintptr_t)&__aeabi_l2f },
         { "__aeabi_ldivmod", (uintptr_t)&__aeabi_ldivmod },
-        { "__aeabi_memclr", (uintptr_t)&__aeabi_memclr },
-        { "__aeabi_memclr4", (uintptr_t)&__aeabi_memclr },
-        { "__aeabi_memclr8", (uintptr_t)&__aeabi_memclr },
-        { "__aeabi_memcpy", (uintptr_t)&sceClibMemcpy },
-        { "__aeabi_memcpy4", (uintptr_t)&sceClibMemcpy },
-        { "__aeabi_memcpy8", (uintptr_t)&sceClibMemcpy },
-        { "__aeabi_memmove", (uintptr_t)&__aeabi_memmove },
-        { "__aeabi_memmove4", (uintptr_t)&__aeabi_memmove },
-        { "__aeabi_memmove8", (uintptr_t)&__aeabi_memmove },
+        { "__aeabi_memclr", (uintptr_t)&custom_aeabi_memclr },
+        { "__aeabi_memclr4", (uintptr_t)&custom_aeabi_memclr },
+        { "__aeabi_memclr8", (uintptr_t)&custom_aeabi_memclr },
+        { "__aeabi_memcpy", (uintptr_t)&custom_memcpy },
+        { "__aeabi_memcpy4", (uintptr_t)&custom_memcpy },
+        { "__aeabi_memcpy8", (uintptr_t)&custom_memcpy },
+        { "__aeabi_memmove", (uintptr_t)&custom_memmove },
+        { "__aeabi_memmove4", (uintptr_t)&custom_memmove },
+        { "__aeabi_memmove8", (uintptr_t)&custom_memmove },
         { "__aeabi_memset", (uintptr_t)&__aeabi_memset },
         { "__aeabi_memset4",  (uintptr_t)&__aeabi_memset4 },
-        { "__aeabi_memset8", (uintptr_t)&__aeabi_memset8 },
+        { "__aeabi_memset8", (uintptr_t)&custom_aeabi_memset },
         { "__aeabi_ui2d", (uintptr_t)&__aeabi_ui2d },
         { "__aeabi_uidiv", (uintptr_t)&__aeabi_uidiv },
         { "__aeabi_uidivmod", (uintptr_t)&__aeabi_uidivmod },
@@ -347,7 +480,7 @@ so_default_dynlib default_dynlib[] = {
         { "malloc", (uintptr_t)&malloc },
         { "memalign", (uintptr_t)&memalign },
         { "memcmp", (uintptr_t)&memcmp },
-        { "memcpy", (uintptr_t)&sceClibMemcpy },
+        { "memcpy", (uintptr_t)&custom_memcpy },
         { "memmem", (uintptr_t)&memmem },
         { "memmove", (uintptr_t)&memmove },
         { "memset", (uintptr_t)&memset },
@@ -497,7 +630,7 @@ so_default_dynlib default_dynlib[] = {
         { "eglQueryContext", (uintptr_t)&eglQueryContext },
         { "eglQueryString", (uintptr_t)&eglQueryString },
         { "eglQuerySurface", (uintptr_t)&eglQuerySurface },
-        { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers },
+        { "eglSwapBuffers", (uintptr_t)&hooked_eglSwapBuffers },
         { "eglTerminate", (uintptr_t)&eglTerminate },
 
 
@@ -512,7 +645,7 @@ so_default_dynlib default_dynlib[] = {
         { "glBindFramebufferOES", (uintptr_t)&glBindFramebuffer },
         { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
         { "glBindRenderbufferOES", (uintptr_t)&glBindRenderbuffer },
-        { "glBindTexture", (uintptr_t)&glBindTexture },
+        { "glBindTexture", (uintptr_t)&hooked_glBindTexture },
         { "glBlendColor", (uintptr_t)&ret0 },
         { "glBlendEquation", (uintptr_t)&glBlendEquation },
         { "glBlendEquationOES", (uintptr_t)&glBlendEquation },
@@ -525,8 +658,8 @@ so_default_dynlib default_dynlib[] = {
         { "glBufferSubData", (uintptr_t)&glBufferSubData },
         { "glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus },
         { "glCheckFramebufferStatusOES", (uintptr_t)&glCheckFramebufferStatus },
-        { "glClear", (uintptr_t)&glClear },
-        { "glClearColor", (uintptr_t)&glClearColor },
+        { "glClear", (uintptr_t)&hooked_glClear },
+        { "glClearColor", (uintptr_t)&hooked_glClearColor },
         { "glClearColorx", (uintptr_t)&glClearColorx },
         { "glClearDepthf", (uintptr_t)&glClearDepthf },
         { "glClearDepthx", (uintptr_t)&glClearDepthx },
@@ -564,8 +697,8 @@ so_default_dynlib default_dynlib[] = {
         { "glDisable", (uintptr_t)&glDisable },
         { "glDisableClientState", (uintptr_t)&glDisableClientState },
         { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-        { "glDrawArrays", (uintptr_t)&glDrawArrays },
-        { "glDrawElements", (uintptr_t)&glDrawElements },
+        { "glDrawArrays", (uintptr_t)&hooked_glDrawArrays },
+        { "glDrawElements", (uintptr_t)&hooked_glDrawElements },
         { "glDrawTexfOES", (uintptr_t)&ret0 },
         { "glDrawTexfvOES", (uintptr_t)&ret0 },
         { "glDrawTexiOES", (uintptr_t)&ret0 },

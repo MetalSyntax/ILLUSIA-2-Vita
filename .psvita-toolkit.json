@@ -1,0 +1,17 @@
+{
+  "game_name": "ILLUSIA 2",
+  "slug": "illusia2",
+  "project_name": "illusia2",
+  "titleid": "ILLUSIA02",
+  "vita_ip": "192.168.3.15",
+  "vita_port": 1337,
+  "apk_basename": "",
+  "build_dir": "build",
+  "vita_downloads_dir": "/ux0:/downloads",
+  "vita_data_dir": "/ux0:/data",
+  "vita_logs_dir": "/ux0:/data/illusia2/logs",
+  "vita_cg_dir": "ux0:/data/illusia2/cg",
+  "vita_glsl_dir": "ux0:/data/illusia2/glsl",
+  "vita_game_data_dir": "/ux0:/data/illusia2",
+  "main_so": "libgameDSO.so"
+}

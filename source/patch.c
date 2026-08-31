@@ -1,11 +1,63 @@
+
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <kubridge.h>
 #include <so_util/so_util.h>
 #include "utils/logger.h"
 
+#include <stdint.h>
+#include <stdlib.h>
+
+
+
+static void *hooked_Gcx_MM_Alloc(uint32_t size) {
+    return calloc(1, size);
+}
+static void *hooked_Gcx_MM_Calloc(uint32_t size) {
+    return calloc(1, size);
+}
+static void hooked_Gcx_MM_Free(void *ptr) {
+    if (ptr) free(ptr);
+}
+static void *hooked_Gcx_MM_Realloc(void *ptr, uint32_t size) {
+    return realloc(ptr, size);
+}
+static void *hooked_operator_new(uint32_t size) {
+    return calloc(1, size);
+}
+static void *hooked_operator_new_array(uint32_t size) {
+    return calloc(1, size);
+}
+static void hooked_operator_delete(void *ptr) {
+    if (ptr) free(ptr);
+}
+static void hooked_operator_delete_array(void *ptr) {
+    if (ptr) free(ptr);
+}
+
 extern so_module so_mod;
+
+void patch_symbol(const char *symbol, uintptr_t dest) {
+    uintptr_t sym = (uintptr_t)so_symbol(&so_mod, symbol);
+    if (sym) hook_thumb(sym | 1, dest);
+}
+
+
+#define SO_CONTINUE(ret, h, ...) ({ \
+  kuKernelCpuUnrestrictedMemcpy((void *)h.addr, h.orig_instr, sizeof(h.orig_instr)); \
+  kuKernelFlushCaches((void *)h.addr, sizeof(h.orig_instr)); \
+  ret _ret = 0; \
+  if (h.thumb_addr) { \
+      _ret = ((ret(*)())h.thumb_addr)(__VA_ARGS__); \
+  } else { \
+      _ret = ((ret(*)())h.addr)(__VA_ARGS__); \
+  } \
+  kuKernelCpuUnrestrictedMemcpy((void *)h.addr, h.patch_instr, sizeof(h.patch_instr)); \
+  kuKernelFlushCaches((void *)h.addr, sizeof(h.patch_instr)); \
+  _ret; \
+})
 
 #define SO_CONTINUE_VOID(h, ...) do { \
   kuKernelCpuUnrestrictedMemcpy((void *)h.addr, h.orig_instr, sizeof(h.orig_instr)); \
@@ -18,6 +70,38 @@ extern so_module so_mod;
   kuKernelCpuUnrestrictedMemcpy((void *)h.addr, h.patch_instr, sizeof(h.patch_instr)); \
   kuKernelFlushCaches((void *)h.addr, sizeof(h.patch_instr)); \
 } while (0)
+
+
+
+static uint8_t *get_main_tile_data(void *map) {
+    if (!map) return NULL;
+    void *layers = *(void **)((char *)map + 0xf0);
+    if (!layers) return NULL;
+    int layer_count = *(int *)((char *)map + 0xd8);
+    // Prefer layer 1 (typical collision layer for foreground) over layer 0
+    if (layer_count > 1) {
+        uint8_t *l1 = *(uint8_t **)((char *)layers + 24 + 12);
+        if (l1 && (uintptr_t)l1 >= 0x10000) return l1;
+    }
+    if (layer_count > 0) {
+        uint8_t *l0 = *(uint8_t **)((char *)layers + 12);
+        if (l0 && (uintptr_t)l0 >= 0x10000) return l0;
+    }
+    return NULL;
+}
+
+static so_hook hook_map_draw;
+static so_hook hook_create_minimap;
+static so_hook hook_layer_draw;
+static so_hook hook_draw_numbers;
+static so_hook hook_draw_damage;
+static so_hook hook_num_draw;
+static so_hook hook_draw_damage_obj;
+static so_hook hook_draw_npc_head;
+static so_hook hook_load_tile_image;
+static so_hook hook_objmgr_draw;
+static so_hook hook_is_drawable;
+static so_hook hook_check_rect_in_screen;
 
 static void *(*MC_grpCreateOffScreenFrameBuffer)(int w, int h) = NULL;
 static uint16_t (*MC_grpGetPixelFromRGB)(uint8_t r, uint8_t g, uint8_t b) = NULL;
@@ -53,23 +137,45 @@ static const int8_t dir_deltas[8][2] = {
 /*
  * Helper to check if current map layers and tile data are fully loaded and accessible.
  */
-static inline int is_map_tiledata_ready(void) {
+static uint8_t *swap_dummy_tile_data(void) {
     void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
-    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x80000000) return 0;
+    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x10000) return NULL;
     char *map = (char *)*pMapSingleton;
+    void *layers = *(void **)(map + 0xf0);
+    if (!layers || (uintptr_t)layers < 0x10000) return (uint8_t *)-1;
+    uint8_t **pTileData = (uint8_t **)((char *)layers + 12);
+    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
+    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
 
-    int layer_count = *(int *)(map + 0xd8);
+    if (*pTileData) return NULL;
+
     int map_w = *(int *)(map + 0xdc);
     int map_h = *(int *)(map + 0xe0);
-    if (layer_count <= 0 || map_w <= 0 || map_h <= 0) return 0;
+    if (map_w < 0) map_w = 0;
+    if (map_h < 0) map_h = 0;
+    int required_size = map_w * map_h * 3 + 16;
+    static uint8_t *dummy_tile_data = NULL;
+    static int dummy_tile_size = 0;
+    if (required_size > dummy_tile_size) {
+        if (dummy_tile_data) free(dummy_tile_data);
+        dummy_tile_data = calloc(1, required_size);
+        dummy_tile_size = required_size;
+    }
+    *pTileData = dummy_tile_data;
+    return dummy_tile_data;
+}
 
+static void restore_dummy_tile_data(uint8_t *dummy_ptr) {
+    if (!dummy_ptr) return;
+    void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
+    if (!pMapSingleton || !*pMapSingleton) return;
+    char *map = (char *)*pMapSingleton;
     void *layers = *(void **)(map + 0xf0);
-    if (!layers || (uintptr_t)layers < 0x80000000) return 0;
-
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData || (uintptr_t)tileData < 0x80000000) return 0;
-
-    return 1;
+    if (!layers) return;
+    uint8_t **pTileData = (uint8_t **)((char *)layers + 12);
+    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
+    if (*(int *)(map + 0xd8) > 1) pTileData = (uint8_t **)((char *)layers + 24 + 12);
+    if (*pTileData == dummy_ptr) *pTileData = NULL;
 }
 
 /*
@@ -81,7 +187,7 @@ static int gpzxsf_log_count = 0;
 
 static void *hooked_GsPZxSubFrame(void *pFrame, int subframe_index) {
     /* Original GsPZxSubFrame has NO range check at all (just pFrame->subframes
-     * + index*0x18) — this hook's [0x80000000,0xa0000000) window was added
+     * + index*0x18) — this hook's [0x10000,0xa0000000) window was added
      * defensively and no caller in the .so was written to expect a NULL
      * back from it. If real sprite/animation frame pointers ever legitimately
      * fall outside this window, every caller silently draws nothing instead
@@ -89,7 +195,7 @@ static void *hooked_GsPZxSubFrame(void *pFrame, int subframe_index) {
      * crash. Logging (rate-limited) instead of widening the range blind,
      * since the same window is confirmed correct for CMvMap/CMvLayer
      * pointers (rendering works) and may simply be a different case here. */
-    if (!pFrame || (uintptr_t)pFrame < 0x80000000 || (uintptr_t)pFrame >= 0xa0000000) {
+    if (!pFrame || (uintptr_t)pFrame < 0x10000 || (uintptr_t)pFrame == 0xFFFFFFFF) {
         if (gpzxsf_log_count < GPZXSF_LOG_MAX) {
             gpzxsf_log_count++;
             game_log("[GsPZxSubFrame] out-of-range pFrame=%p (idx=%d)\n", pFrame, subframe_index);
@@ -97,7 +203,7 @@ static void *hooked_GsPZxSubFrame(void *pFrame, int subframe_index) {
         return NULL;
     }
     uintptr_t subframes = *(uintptr_t *)((char *)pFrame + 8);
-    if (!subframes || subframes < 0x80000000 || subframes >= 0xa0000000) {
+    if (!subframes || subframes < 0x10000 || subframes == 0xFFFFFFFF) {
         if (gpzxsf_log_count < GPZXSF_LOG_MAX) {
             gpzxsf_log_count++;
             game_log("[GsPZxSubFrame] out-of-range subframes=%p (pFrame=%p idx=%d)\n", (void *)subframes, pFrame, subframe_index);
@@ -145,7 +251,7 @@ static void hooked_CMvGraphics_DrawDamage(void *self, int font_idx, int x, int y
         font_idx = 0;
     }
     void *pFrame = ppFrames[font_idx];
-    if (!pFrame || (uintptr_t)pFrame < 0x80000000 || (uintptr_t)pFrame >= 0xa0000000) return;
+    if (!pFrame || (uintptr_t)pFrame < 0x10000 || (uintptr_t)pFrame == 0xFFFFFFFF) return;
 
     char str[32];
     snprintf(str, sizeof(str), "%d", amount);
@@ -160,7 +266,7 @@ static void hooked_CMvGraphics_DrawDamage(void *self, int font_idx, int x, int y
         void *pSubFrame = hooked_GsPZxSubFrame(pFrame, digit);
         if (pSubFrame) {
             void *pSprite = *(void **)pSubFrame;
-            if (pSprite && (uintptr_t)pSprite >= 0x80000000 && (uintptr_t)pSprite < 0xa0000000) {
+            if (pSprite && (uintptr_t)pSprite >= 0x10000 && (uintptr_t)pSprite != 0xFFFFFFFF) {
                 void (*sprite_draw)(void *, int, int, int, int, int) = *(void **)(*(int *)pSprite + 0x14);
                 int (*sprite_width)(void *) = *(int (**)(void *))(*(int *)pSprite + 0x1c);
                 int r = RandomFunc ? RandomFunc(param_5 * 2 + 1) : 0;
@@ -182,106 +288,7 @@ static void hooked_CMvGraphics_DrawDamage(void *self, int font_idx, int x, int y
 static int hooked_CMvGraphics_DrawNumbers(void *self, int font_idx, int x, int y, const char *str,
                                          int param_5, uint32_t param_6, int param_7, int param_8) {
     if (!self || !str) return 0;
-    if (font_idx < 0) return 0;
-
-    void **pResourceMgrSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI14CMvResourceMgrE13ms_pSingletonE");
-    if (!pResourceMgrSingleton || !*pResourceMgrSingleton) return 0;
-    char *resMgr = (char *)*pResourceMgrSingleton;
-
-    void *pCommonRes = *(void **)(resMgr + 4);
-    if (!pCommonRes) return 0;
-
-    void *pResInfoArray = *(void **)((char *)pCommonRes + 0x10);
-    if (!pResInfoArray) return 0;
-
-    void *pNumberImage = *(void **)((char *)pResInfoArray + 5 * 12 + 4);
-    if (!pNumberImage) return 0;
-
-    void *pAni = *(void **)((char *)pNumberImage + 8);
-    if (!pAni) return 0;
-
-    void *pFrameMgr = *(void **)((char *)pAni + 12);
-    if (!pFrameMgr) return 0;
-
-    int frameCount = *(int *)((char *)pFrameMgr + 12);
-    void **ppFrames = *(void ***)((char *)pFrameMgr + 8);
-    if (!ppFrames || frameCount <= 0) return 0;
-
-    if (font_idx >= frameCount) {
-        font_idx = 0;
-    }
-    void *pFrame = ppFrames[font_idx];
-    if (!pFrame || (uintptr_t)pFrame < 0x80000000 || (uintptr_t)pFrame >= 0xa0000000) return 0;
-
-    int len = strlen(str);
-    if (len <= 0) return 0;
-
-    int cur_x = 0;
-    int local_38;
-    if ((unsigned char)(str[0] - '0') < 10) {
-        local_38 = len % 3;
-    } else {
-        local_38 = (len - 1) % 3;
-    }
-    if (local_38 == 0) local_38 = 3;
-
-    for (int i = 0; i < len; i++) {
-        if (param_7 && local_38 == 0) {
-            void *pSub = hooked_GsPZxSubFrame(pFrame, 0xe);
-            if (pSub) {
-                void *pSprite = *(void **)pSub;
-                if (pSprite && (uintptr_t)pSprite >= 0x80000000 && (uintptr_t)pSprite < 0xa0000000) {
-                    if (param_8) {
-                        void (*sprite_draw)(void *, int, int, int, int, int) = *(void **)(*(int *)pSprite + 0x14);
-                        if (sprite_draw) sprite_draw(pSprite, cur_x + x, y, 0xe, param_6, 0);
-                    }
-                    int (*sprite_width)(void *) = *(int (**)(void *))(*(int *)pSprite + 0x1c);
-                    int w = sprite_width ? sprite_width(pSprite) : 0;
-                    local_38 = 3;
-                    cur_x += param_5 + w;
-                }
-            }
-        }
-
-        unsigned char c = (unsigned char)str[i];
-        int sub_idx = -1;
-        int delta_y = 0;
-
-        switch (c - 0x20) {
-        case 0: sub_idx = 0; break;
-        case 3: sub_idx = 0xb; break;
-        case 5: sub_idx = 0x12; break;
-        case 10: sub_idx = 10; break;
-        case 0xb: sub_idx = 0xc; break;
-        case 0xc: sub_idx = 0xe; break;
-        case 0xd: sub_idx = 0xd; break;
-        case 0xe: sub_idx = 0x11; break;
-        case 0xf: sub_idx = 0x10; break;
-        case 0x1a: sub_idx = 0xf; break;
-        default:
-            sub_idx = c - '0';
-            local_38--;
-            break;
-        }
-
-        if (sub_idx >= 0) {
-            void *pSub = hooked_GsPZxSubFrame(pFrame, sub_idx);
-            if (pSub) {
-                void *pSprite = *(void **)pSub;
-                if (pSprite && (uintptr_t)pSprite >= 0x80000000 && (uintptr_t)pSprite < 0xa0000000) {
-                    delta_y = *(int16_t *)((char *)pSub + 6);
-                    if (param_8) {
-                        void (*sprite_draw)(void *, int, int, int, int, int) = *(void **)(*(int *)pSprite + 0x14);
-                        if (sprite_draw) sprite_draw(pSprite, cur_x + x, y + delta_y, 0xe, param_6, 0);
-                    }
-                    int (*sprite_width)(void *) = *(int (**)(void *))(*(int *)pSprite + 0x1c);
-                    int w = sprite_width ? sprite_width(pSprite) : 0;
-                    cur_x += param_5 + w;
-                }
-            }
-        }
-    }
-    return cur_x;
+    return SO_CONTINUE(int, hook_draw_numbers, self, font_idx, x, y, str, param_5, param_6, param_7, param_8);
 }
 
 /*
@@ -289,43 +296,8 @@ static int hooked_CMvGraphics_DrawNumbers(void *self, int font_idx, int x, int y
  * _ZN15CMvNumberObject4DrawEv
  */
 static void hooked_CMvNumberObject_Draw(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (*(uint8_t *)((char *)self + 0xc) >= 0x80) return;
-
-    void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
-    if (!pMapSingleton || !*pMapSingleton) return;
-    char *pMap = (char *)*pMapSingleton;
-
-    void **pMvGraphicsSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI11CMvGraphicsE13ms_pSingletonE");
-    if (!pMvGraphicsSingleton || !*pMvGraphicsSingleton) return;
-    void *pGraphics = *pMvGraphicsSingleton;
-
-    int amount = *(int *)((char *)self + 8);
-    int (*GsLogFunc)(int, int) = (int (*)(int, int))so_symbol(&so_mod, "_Z5GsLogii");
-    int iVar1 = GsLogFunc ? GsLogFunc(amount, 10) : 1;
-
-    int v1 = (int)*(int8_t *)((char *)self + 0xf) >> 1;
-    int iVar3 = 0xf;
-    if (v1 <= (int)*(int8_t *)((char *)self + 0xe)) {
-        int diff = (int)*(int8_t *)((char *)self + 0xf) - (int)*(int8_t *)((char *)self + 0xe);
-        int div = (v1 + 1);
-        int v2 = div > 0 ? (diff * 16) / div : 0;
-        iVar3 = 0;
-        if (v2 > 0) {
-            iVar3 = (v2 > 0xf) ? 0xf : v2;
-        }
-    }
-
-    int font_idx = (int)*(int8_t *)((char *)self + 0x10);
-    uint16_t obj_x = *(uint16_t *)((char *)self + 4);
-    uint16_t obj_y = *(uint16_t *)((char *)self + 6);
-    int16_t map_tx = *(int16_t *)(pMap + 0xac);
-    int16_t map_ty = *(int16_t *)(pMap + 0xae);
-
-    int screen_x = (int)(int16_t)(obj_x - ((iVar1 + 1) * 8) - map_tx);
-    int screen_y = (int)(int16_t)(obj_y - 8 - map_ty) - 15;
-
-    hooked_CMvGraphics_DrawDamage(pGraphics, font_idx, screen_x, screen_y, amount, 0, -4, 1, iVar3);
+    if (!self || (uintptr_t)self < 0x10000) return;
+    SO_CONTINUE_VOID(hook_num_draw, self);
 }
 
 /*
@@ -333,12 +305,8 @@ static void hooked_CMvNumberObject_Draw(void *self) {
  * _ZN12CMvObjectMgr16DrawDamageObjectEv
  */
 static void hooked_CMvObjectMgr_DrawDamageObject(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-
-    for (int i = 0; i < 20; i++) {
-        void *pNumObj = (char *)self + i * 0x14 + 0x98;
-        hooked_CMvNumberObject_Draw(pNumObj);
-    }
+    if (!self || (uintptr_t)self < 0x10000) return;
+    SO_CONTINUE_VOID(hook_draw_damage_obj, self);
 }
 
 /*
@@ -346,27 +314,8 @@ static void hooked_CMvObjectMgr_DrawDamageObject(void *self) {
  * _ZN12CMvObjectMgr15DrawNpcHeadInfoEv
  */
 static void hooked_CMvObjectMgr_DrawNpcHeadInfo(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-
-    typedef void (*DrawHeadInfoFunc)(void *this);
-    DrawHeadInfoFunc DrawHeadInfo = (DrawHeadInfoFunc)so_symbol(&so_mod, "_ZN6CMvNPC12DrawHeadInfoEv");
-    if (!DrawHeadInfo) return;
-
-    for (int group = 0; group < 2; group++) {
-        char *pGroup = (char *)self + 0x78 + group * 16;
-        void **ppObjects = *(void ***)pGroup;
-        int count = *(int *)(pGroup + 4);
-        if (!ppObjects || count <= 0 || (uintptr_t)ppObjects < 0x80000000) continue;
-
-        for (int i = 0; i < count; i++) {
-            void *pObj = ppObjects[i];
-            if (pObj && (uintptr_t)pObj >= 0x80000000) {
-                if (*(int8_t *)((char *)pObj + 4) == 1) {
-                    DrawHeadInfo(pObj);
-                }
-            }
-        }
-    }
+    if (!self || (uintptr_t)self < 0x10000) return;
+    SO_CONTINUE_VOID(hook_draw_npc_head, self);
 }
 
 /*
@@ -374,37 +323,78 @@ static void hooked_CMvObjectMgr_DrawNpcHeadInfo(void *self) {
  * _ZN9CMvObject12GetMapAttribEii7EnumDiri
  */
 static uint16_t hooked_CMvObject_GetMapAttrib(void *self, int tx, int ty, int dir, int step) {
-    if (tx == -1 && self && (uintptr_t)self >= 0x80000000) {
+    if (tx == -1 && self && (uintptr_t)self >= 0x10000) {
         tx = *(uint8_t *)((char *)self + 0x26);
     }
-    if (ty == -1 && self && (uintptr_t)self >= 0x80000000) {
+    if (ty == -1 && self && (uintptr_t)self >= 0x10000) {
         ty = *(uint8_t *)((char *)self + 0x27);
     }
 
+    int target_x = tx;
+    int target_y = ty;
+    if (dir != -1 && dir >= 0 && dir < 8) {
+        target_x += (int)dir_deltas[dir][0] * step;
+        target_y += (int)dir_deltas[dir][1] * step;
+    }
+
     void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
-    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x80000000) return 1;
+    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x10000) return 1;
     char *map = (char *)*pMapSingleton;
 
     int layer_count = *(int *)(map + 0xd8);
     int map_w = *(int *)(map + 0xdc);
     int map_h = *(int *)(map + 0xe0);
 
-    if (layer_count <= 0 || map_w <= 0 || map_h <= 0) return 1;
+    if (layer_count <= 0 || map_w <= 0 || map_h <= 0) {
+        return (target_y >= 14) ? 1 : 0;
+    }
 
     void *layers = *(void **)(map + 0xf0);
-    if (!layers || (uintptr_t)layers < 0x80000000) return 1;
+    if (!layers || (uintptr_t)layers < 0x10000) {
+        return (target_y >= 14) ? 1 : 0;
+    }
 
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData || (uintptr_t)tileData < 0x80000000) return 1;
-
-    int target_x = tx;
-    int target_y = ty;
-
-    if (dir != -1) {
-        if (dir >= 0 && dir < 8) {
-            target_x += (int)dir_deltas[dir][0] * step;
-            target_y += (int)dir_deltas[dir][1] * step;
+    uint8_t *tileData = get_main_tile_data(map);
+    if (!tileData || (uintptr_t)tileData < 0x10000) {
+        /* FIX (2026-08-30): this null-tileData case previously always
+         * returned 0 ("empty, no floor here") with no fallback, unlike the
+         * sibling hooked_CMvMapObject_GetTileAttr/hooked_CMvObject_GetTileAttr/
+         * hooked_CMvObjectMgr_GetTileAttr_Obj hooks (same file), which already
+         * use this exact ty>=14 virtual-floor convention for the identical
+         * null-tileData case (ScrollBG-only cutscene maps with no real tile
+         * grid, e.g. map_id=2/92). CMvObject::UpdateFalling/DoFallProc/
+         * CMvMapObject::DoUpdateFalling all gate "keep applying gravity" on
+         * this function ever reporting a non-zero (uVar & 0xf)/(uVar & 0x30)
+         * bit -- returning 0 unconditionally meant gravity NEVER found a
+         * floor for these maps, so any object whose vertical movement is
+         * driven through DoFallProc/UpdateFalling (not just the tile-render
+         * path) fell forever. Confirmed live via game_046.log: a falling
+         * object's CheckRectInScreen rect.y0 grew monotonically frame after
+         * frame (437 -> 1642 px, never landing) for exactly this map. Return
+         * the same bit-0 "floor" value the other hooks use once target_y
+         * reaches the virtual floor row, so UpdateFalling's floor-detection
+         * loop (`uVar1 & 0xf`) actually fires and calls SetWorldPosY to land
+         * the object instead of falling indefinitely.
+         *
+         * SUSPECTED REGRESSION (game_047.log): user reports the character
+         * stopped falling (fix confirmed working) but then got stuck unable
+         * to move at all. This function is a general-purpose "attribute at
+         * (tx,ty) offset by dir/step" query -- it's not just called for
+         * straight-down gravity probes, so if landing places the character's
+         * own row exactly at the ty>=14 boundary, EVERY subsequent query
+         * (including horizontal CanMove-style probes that only vary tx) would
+         * also read "solid" here, since this check ignores tx entirely.
+         * Not yet confirmed whether this function is actually in the
+         * horizontal-movement call path -- logging every call while this
+         * branch is active (capped) to find out before changing the
+         * condition further. */
+        static int map_attrib_floor_log_count = 0;
+        if (map_attrib_floor_log_count < 60) {
+            map_attrib_floor_log_count++;
+            game_log("[GetMapAttrib] tx=%d ty=%d dir=%d step=%d target=(%d,%d) -> %s\n",
+                tx, ty, dir, step, target_x, target_y, (target_y >= 14) ? "SOLID(1)" : "empty(0)");
         }
+        return (target_y >= 14) ? 1 : 0;
     }
 
     if (target_x < 0 || target_x >= map_w || target_y < 0 || target_y >= map_h) {
@@ -425,10 +415,10 @@ static int checkride_log_count = 0;
 #define CHECKRIDE_LOG_MAX 50
 
 static int hooked_CMvPlayer_CheckRide(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return 0;
+    if (!self || (uintptr_t)self < 0x10000) return 0;
 
     void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
-    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x80000000) return 0;
+    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x10000) return 0;
     char *map = (char *)*pMapSingleton;
 
     int layer_count = *(int *)(map + 0xd8);
@@ -437,10 +427,10 @@ static int hooked_CMvPlayer_CheckRide(void *self) {
     if (layer_count <= 0 || map_w <= 0 || map_h <= 0) return 0;
 
     void *layers = *(void **)(map + 0xf0);
-    if (!layers || (uintptr_t)layers < 0x80000000) return 0;
+    if (!layers || (uintptr_t)layers < 0x10000) return 0;
 
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData || (uintptr_t)tileData < 0x80000000) return 0;
+    uint8_t *tileData = get_main_tile_data(map);
+    if (!tileData || (uintptr_t)tileData < 0x10000) return 0;
 
     typedef void *(*GetOccupyFixedObjectFunc)(void *this, int x, int y, int dir, int step);
     GetOccupyFixedObjectFunc GetOccupyFixedObject = (GetOccupyFixedObjectFunc)so_symbol(&so_mod, "_ZN12CMvObjectMgr20GetOccupyFixedObjectEii7EnumDiri");
@@ -520,7 +510,7 @@ static int hooked_CMvPlayer_CheckRide(void *self) {
         }
     }
 
-    if (pRideTarget && (uintptr_t)pRideTarget >= 0x80000000) {
+    if (pRideTarget && (uintptr_t)pRideTarget >= 0x10000) {
         if (*(uint8_t *)((char *)pRideTarget + 4) == 8) {
             int t54 = *(int *)((char *)pRideTarget + 0x54);
             if (t54 != 8 && t54 != 6 && t54 != 0x1b && t54 != 0x20) {
@@ -583,7 +573,7 @@ static int hooked_CMvPlayer_CheckRide(void *self) {
  * _ZN9CMvPlayer10DoFallProcEv
  */
 static int hooked_CMvPlayer_DoFallProc(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return 0;
+    if (!self || (uintptr_t)self < 0x10000) return 0;
 
     int c9 = *(int *)((char *)self + 0x324);
     if (c9 != 0) {
@@ -658,7 +648,7 @@ static int hooked_CMvPlayer_DoFallProc(void *self) {
  * _ZN9CMvObject13UpdateFallingEv
  */
 static int hooked_CMvObject_UpdateFalling(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return 0;
+    if (!self || (uintptr_t)self < 0x10000) return 0;
 
     uint32_t uVar6 = (uint32_t)*(uint8_t *)((char *)self + 0x27);
     uint32_t px = (uint32_t)*(uint8_t *)((char *)self + 0x26);
@@ -708,7 +698,7 @@ static int hooked_CMvObject_UpdateFalling(void *self) {
  * _ZN12CMvMapObject15DoUpdateFallingEv
  */
 static void hooked_CMvMapObject_DoUpdateFalling(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
 
     if (*(int *)((char *)self + 0x54) == 0x17) {
         int (*GetWidth)(void *) = *(int (**)(void *))(*(int *)self + 0x9c);
@@ -752,10 +742,10 @@ static void hooked_CMvMapObject_DoUpdateFalling(void *self) {
  * _ZN12CMvCharacter21DoJumpingSlpDownStairEv
  */
 static void hooked_CMvCharacter_DoJumpingSlpDownStair(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
 
     void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
-    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x80000000) return;
+    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x10000) return;
     char *map = (char *)*pMapSingleton;
 
     int map_h = *(int *)(map + 0xe0);
@@ -818,7 +808,7 @@ static int hooked_CMvItemMgr_DropablePos(void *self, int param_2, int param_3, v
     if (!param_4) return 0;
 
     void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
-    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x80000000) return 0;
+    if (!pMapSingleton || !*pMapSingleton || (uintptr_t)*pMapSingleton < 0x10000) return 0;
     char *map = (char *)*pMapSingleton;
 
     int layer_count = *(int *)(map + 0xd8);
@@ -828,10 +818,10 @@ static int hooked_CMvItemMgr_DropablePos(void *self, int param_2, int param_3, v
     if (layer_count <= 0 || map_w <= 0 || map_h <= 0) return 0;
 
     void *layers = *(void **)(map + 0xf0);
-    if (!layers || (uintptr_t)layers < 0x80000000) return 0;
+    if (!layers || (uintptr_t)layers < 0x10000) return 0;
 
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData || (uintptr_t)tileData < 0x80000000) return 0;
+    uint8_t *tileData = get_main_tile_data(map);
+    if (!tileData || (uintptr_t)tileData < 0x10000) return 0;
 
     typedef uint32_t (*GetOccupyMaskFunc)(void *this, int x, int y, uint32_t mask, int b);
     GetOccupyMaskFunc GetOccupyMask = (GetOccupyMaskFunc)so_symbol(&so_mod, "_ZN12CMvObjectMgr13GetOccupyMaskEiijb");
@@ -878,188 +868,391 @@ static int hooked_CMvItemMgr_DropablePos(void *self, int param_2, int param_3, v
  * Located at text_base + 0x000bc128
  */
 static uint16_t hooked_CMvMapObject_GetTileAttr(void *map, int tx, int ty) {
-    if (!map || (uintptr_t)map < 0x80000000) return 1;
+    if (!map || (uintptr_t)map < 0x10000) return 1;
+
+    void *layers = *(void **)((char *)map + 0xf0);
+    if (!layers || (uintptr_t)layers < 0x10000) return 1;
+
+    uint8_t *tileData = get_main_tile_data(map);
+    int map_h = *(int *)((char *)map + 0xe0);
+
+    if (!tileData || (uintptr_t)tileData < 0x10000) {
+        if (ty >= 14) return 1;
+        return 0;
+    }
 
     int layer_count = *(int *)((char *)map + 0xd8);
     int map_w = *(int *)((char *)map + 0xdc);
-    int map_h = *(int *)((char *)map + 0xe0);
 
     if (layer_count < 1 || tx < 0 || tx >= map_w || ty < 0 || ty >= map_h) {
         return 1;
     }
-
-    void *layers = *(void **)((char *)map + 0xf0);
-    if (!layers || (uintptr_t)layers < 0x80000000) return 1;
-
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData || (uintptr_t)tileData < 0x80000000) return 1;
 
     int tile_idx = (ty * map_w + tx) * 3;
     uint8_t f1 = tileData[tile_idx + 1];
     uint8_t f2 = tileData[tile_idx + 2];
     return (uint16_t)f1 | ((uint16_t)f2 << 8);
 }
-
-/*
- * Hook for CMvMap::CreateMiniMap()
- * _ZN6CMvMap13CreateMiniMapEv
- */
 static void hooked_CreateMiniMap(void *self) {
     if (!self) return;
-    int w = *(int *)((char *)self + 0xdc);
-    int h = *(int *)((char *)self + 0xe0);
-    if (w <= 0 || h <= 0) return;
-
-    if (!MC_grpCreateOffScreenFrameBuffer || !MC_grpGetPixelFromRGB) return;
-
-    void *fb = MC_grpCreateOffScreenFrameBuffer(w, h);
-    *(void **)((char *)self + 0xd0) = fb;
-    if (!fb) return;
-
-    uint16_t *pixels = *(uint16_t **)((char *)fb + 16);
-    if (!pixels) return;
-
-    uint16_t gray = MC_grpGetPixelFromRGB(128, 128, 128);
-    uint16_t blue = MC_grpGetPixelFromRGB(48, 48, 223);
-
-    int layer_count = *(int *)((char *)self + 0xd8);
     void *layers = *(void **)((char *)self + 0xf0);
-    uint8_t *tileData = NULL;
-    if (layers && layer_count > 0) {
-        tileData = *(uint8_t **)((char *)layers + 12);
-    }
+    if (!layers) return;
+    uint8_t *tileData = get_main_tile_data(self);
+    if (!tileData) return;
+    SO_CONTINUE_VOID(hook_create_minimap, self);
+}
 
-    for (int y = 0; y < h; y++) {
-        uint16_t *row = pixels + (y * w);
-        for (int x = 0; x < w; x++) {
-            uint16_t pixel = blue;
-            if (tileData && y < h && x < w) {
-                int tile_idx = y * w + x;
-                uint8_t *tile = tileData + tile_idx * 3;
-                uint16_t flag = (uint16_t)tile[1] | ((uint16_t)tile[2] << 8);
-                if (!(flag & 0x100) && !(flag & 0x0f) && !(flag & 0x30) && !(flag & 0x40)) {
-                    pixel = gray;
-                }
-            }
-            row[x] = pixel;
-        }
-    }
+/*
+ * Diagnostic-only passthrough for CMvMap::LoadTileImage(int mapId).
+ * _ZN6CMvMap13LoadTileImageEi
+ *
+ * Per the Ghidra decompile, this is the ONLY function that writes self+0xc8
+ * ("pTileImages"): it releases the previous map's tile-image resource (a
+ * virtual call through that resource's own vtable), then calls
+ * MvLoadPzx("map/%03d.pzx", mapId) and stores the result at self+0xc8 --
+ * possibly NULL if the load/parse failed even though the underlying file was
+ * read successfully via our readAssets JNI bridge (isAssetExist/readAssets
+ * logs only prove the bytes were delivered, not that MvLoadPzx accepted
+ * them). Logs the map id and whether pTileImages ended up populated for
+ * every map load (uncapped -- map loads are rare, not per-frame), pairs with
+ * the [MapDraw] state-transition log above to pinpoint exactly which map
+ * transition leaves rendering permanently blocked.
+ */
+static void hooked_CMvMap_LoadTileImage(void *self, int map_id) {
+    if (!self) return;
+    SO_CONTINUE_VOID(hook_load_tile_image, self, map_id);
+    void *pTileImages = *(void **)((char *)self + 200);
+    game_log("[LoadTileImage] map=%03d -> pTileImages=%p (%s)\n",
+        map_id, pTileImages, pTileImages ? "OK" : "NULL/FAILED");
 }
 
 /*
  * Hook for CMvMap::DrawMiniMap()
  * _ZN6CMvMap11DrawMiniMapEv
  */
+
 static so_hook hook_draw_minimap;
 static void hooked_CMvMap_DrawMiniMap(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
+    void *layers = *(void **)((char *)self + 0xf0);
+    if (!layers) return;
+    uint8_t *tileData = get_main_tile_data(self);
+    if (!tileData) return;
 
     void **pObjMgrSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI12CMvObjectMgrE13ms_pSingletonE");
-    if (!pObjMgrSingleton || !*pObjMgrSingleton || (uintptr_t)*pObjMgrSingleton < 0x80000000) return;
+    if (!pObjMgrSingleton || !*pObjMgrSingleton || (uintptr_t)*pObjMgrSingleton < 0x10000) return;
     void *pPlayer = *(void **)((char *)*pObjMgrSingleton + 8);
-    if (!pPlayer || (uintptr_t)pPlayer < 0x80000000) return;
+    if (!pPlayer || (uintptr_t)pPlayer < 0x10000) return;
 
     SO_CONTINUE_VOID(hook_draw_minimap, self);
 }
 
 /*
+ * Diagnostic passthrough hook for CMvScrollBG::DrawH(int, int)
+ * _ZN11CMvScrollBG5DrawHEii
+ *
+ * User-reported: story cutscenes that use a scrolling background (as opposed
+ * to a plain tile map) look completely static -- no parallax/cloud motion --
+ * after picking a character. CMvMap::Draw calls this every frame with a
+ * scroll offset; the offset itself, and ambient effects layered on top
+ * (DrawDistantView, the type-5 sprite-cycle block further down in this same
+ * function), are driven by CMvScrollBG::Update() advancing this+0xc from the
+ * global CGxFrameT1 tick (GxGetFrameT1()->+0xd0). Neither CMvScrollBG::DrawH
+ * nor ::Update is hooked/reimplemented by this port -- both run as pristine
+ * original ARM code -- so if the background truly never moves, this log
+ * should reveal whether it's (a) the tick itself never advancing, (b) DrawH
+ * being called with an unchanging (x,y) despite the tick advancing, or (c)
+ * neither -- in which case "static" is more likely the 480x320-canvas
+ * scaling regression (see project memory) making motion imperceptible in a
+ * squeezed corner rather than a real animation freeze.
+ */
+static so_hook hook_scrollbg_drawh;
+static int scrollbg_log_count = 0;
+#define SCROLLBG_LOG_MAX 40
+
+static void hooked_CMvScrollBG_DrawH(void *self, int x, int y) {
+    if (scrollbg_log_count < SCROLLBG_LOG_MAX) {
+        scrollbg_log_count++;
+        typedef void *(*GxGetFrameT1Func)(void);
+        GxGetFrameT1Func GxGetFrameT1 = (GxGetFrameT1Func)so_symbol(&so_mod, "_Z12GxGetFrameT1v");
+        void *frameT1 = GxGetFrameT1 ? GxGetFrameT1() : NULL;
+        int tick = (frameT1 && (uintptr_t)frameT1 >= 0x10000) ? *(int *)((char *)frameT1 + 0xd0) : -1;
+        int bg_type = self ? *(int *)self : -1;
+        game_log("[ScrollBG] DrawH(x=%d, y=%d) type=%d tick=%d\n", x, y, bg_type, tick);
+    }
+    SO_CONTINUE_VOID(hook_scrollbg_drawh, self, x, y);
+}
+
+/*
  * Hook for CMvLayer::Draw()
  * _ZN8CMvLayer4DrawEiiP12tagTILEPOINTb10enumDrawOPi
+ *
+ * FIX (2026-08-30): CMvMap::Draw (verified via arm-vita-eabi-objdump at
+ * 0x96e46/0x96e78/0x96f12/0x9708a) calls this once per Z-layer (layers+0,
+ * +24, +48) and then, completely unconditionally, calls the real
+ * CMvObjectMgr::Draw (0x96e56/0x96e82/0x96f20/0x97096) for the SAME
+ * z-layer, regardless of what this function did -- this happens whether
+ * CMvMap::Draw took the CMvScrollBG cutscene branch or the plain-tile
+ * branch, they both fall through into the exact same layer+object draw
+ * sequence. So this function returning early was never the reason
+ * CMvObjectMgr::Draw (player/NPC sprites) failed to draw -- but it WAS,
+ * previously, a guaranteed no-op for terrain any time self+12 (this
+ * particular layer's own tile-attribute byte array, a SEPARATE field from
+ * the map's pTileImages checked below) was null. That happens for real:
+ * some maps -- confirmed via a separate investigation of the intro cutscene
+ * map (0x5c/92) -- have map_w/map_h == 0, so CMvMap::PreLoad's
+ * calloc(map_w*map_h*3) is a calloc(0) and self+12 legitimately never gets
+ * a real buffer. Verified via disassembly (0x98436 loads self+12, 0x984a8
+ * dereferences it with NO null check at all) that the pristine original
+ * function really does crash on a genuinely null self+12 -- so the old
+ * `if (!pTileData) return;` guard here was preventing a real crash, not
+ * blocking otherwise-safe rendering, and simply deleting it would trade
+ * "draws nothing" for "crashes". Real fix: swap in a correctly-sized
+ * all-zero dummy tile-attribute buffer for the duration of the call (same
+ * pattern hooked_CMvMap_Draw below already uses for layer 0 only,
+ * generalized here to whichever layer `self` actually is, since all 3
+ * layers can hit this) so the original function runs to completion instead
+ * of being skipped outright.
  */
+static uint8_t *dummy_layer_tile_data = NULL;
+static int dummy_layer_tile_size = 0;
+
 static void hooked_CMvLayer_Draw(void *self, int screen_x, int screen_y, void *tile_pt,
                                  int arg4, int draw_op, int arg6) {
     if (!self) return;
-    uint8_t *pTileData = *(uint8_t **)((char *)self + 12);
-    if (!pTileData) return;
-    if (!tile_pt) return;
-
     void **pMapSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
     if (!pMapSingleton || !*pMapSingleton) return;
     void *pMap = *pMapSingleton;
-
-    int map_w = *(int *)((char *)pMap + 0xdc);
-    int map_h = *(int *)((char *)pMap + 0xe0);
-    if (map_w <= 0 || map_h <= 0) return;
-
     void *pTileImages = *(void **)((char *)pMap + 200);
     if (!pTileImages) return;
 
-    void **pObjMgrSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI12CMvObjectMgrE13ms_pSingletonE");
-    void *pObjMgr = pObjMgrSingleton ? *pObjMgrSingleton : NULL;
-    void *pPlayer = pObjMgr ? *(void **)((char *)pObjMgr + 8) : NULL;
+    uint8_t **pTileData = (uint8_t **)((char *)self + 12);
+    uint8_t *old_tileData = *pTileData;
 
-    uint8_t player_x = pPlayer ? *(uint8_t *)((char *)pPlayer + 0x26) : 0;
-    char player_state = pPlayer ? *(char *)((char *)pPlayer + 0x20) : 0;
-    uint32_t player_y = pPlayer ? (uint32_t)*(uint8_t *)((char *)pPlayer + 0x27) : 0;
-
-    if (screen_y >= 320) return;
-
-    uint8_t tile_start_y = ((uint8_t *)tile_pt)[1];
-    uint32_t cur_tile_y = tile_start_y;
-    int cur_y = screen_y;
-
-    do {
-        if ((cur_y + 15 >= 0) && ((int)cur_tile_y < map_h) && (screen_x < 480)) {
-            uint8_t tile_start_x = ((uint8_t *)tile_pt)[0];
-            int cur_x = screen_x;
-            int tile_x_offset = 0;
-
-            do {
-                int tile_map_x = tile_x_offset + tile_start_x;
-                if ((cur_x + 15 >= 0) && (tile_map_x < map_w)) {
-                    int tile_idx = (cur_tile_y * map_w + tile_map_x) * 3;
-                    uint8_t tile_id = pTileData[tile_idx];
-                    if (tile_id != 0) {
-                        int tile_sprite_idx = tile_id - 1;
-                        int local_54 = 0;
-
-                        if (player_state == 12) {
-                            /* Original checks rows {player_y, player_y+1, player_y-1}, i.e. the
-                             * row above the player too — not player_y+1 twice. */
-                            if ((player_y == cur_tile_y || cur_tile_y == player_y + 1 || (player_y > 0 && cur_tile_y == player_y - 1)) &&
-                                ((tile_start_x - player_x + tile_x_offset) < 6 && (tile_start_x - player_x + tile_x_offset) > -6)) {
-                                int diff = (tile_start_x - player_x + tile_x_offset);
-                                if (diff < 0) diff = -diff;
-                                local_54 = (5 - diff) * 2;
-
-                                void *layer0_data = *(void **)((char *)pMap + 0xf0);
-                                uint8_t *layer0_tiles = layer0_data ? *(uint8_t **)((char *)layer0_data + 12) : NULL;
-                                if (layer0_tiles && *(int *)((char *)pMap + 0xd8) > 0 && player_x < map_w && player_y < map_h) {
-                                    uint8_t f = layer0_tiles[(player_y * map_w + player_x) * 3 + 1];
-                                    if ((f & 0x10) || (f & 0x20)) {
-                                        void *pImagesStruct = *(void **)((char *)pTileImages + 8);
-                                        if (pImagesStruct && tile_sprite_idx < *(int *)((char *)pImagesStruct + 12)) {
-                                            void **sprite_array = *(void ***)((char *)pImagesStruct + 8);
-                                            void *sprite = sprite_array ? sprite_array[tile_sprite_idx] : NULL;
-                                            if (sprite) {
-                                                void (*sprite_draw)(void *, int, int, int, int, int) = *(void **)(*(int *)sprite + 0x14);
-                                                if (sprite_draw) sprite_draw(sprite, cur_x, cur_y, draw_op, arg6, 0);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        void *pImagesStruct = *(void **)((char *)pTileImages + 8);
-                        if (pImagesStruct && tile_sprite_idx < *(int *)((char *)pImagesStruct + 12)) {
-                            void **sprite_array = *(void ***)((char *)pImagesStruct + 8);
-                            void *sprite = sprite_array ? sprite_array[tile_sprite_idx] : NULL;
-                            if (sprite) {
-                                void (*sprite_draw)(void *, int, int, int, int, int) = *(void **)(*(int *)sprite + 0x14);
-                                if (sprite_draw) sprite_draw(sprite, cur_x, cur_y + local_54, draw_op, arg6, 0);
-                            }
-                        }
-                    }
-                }
-                cur_x += 16;
-                tile_x_offset++;
-            } while (cur_x < 480);
+    if (!old_tileData) {
+        int map_w = *(int *)((char *)pMap + 0xdc);
+        int map_h = *(int *)((char *)pMap + 0xe0);
+        if (map_w < 0) map_w = 0;
+        if (map_h < 0) map_h = 0;
+        int required_size = map_w * map_h * 3 + 16;
+        if (required_size > dummy_layer_tile_size) {
+            uint8_t *grown = realloc(dummy_layer_tile_data, required_size);
+            if (grown) {
+                dummy_layer_tile_data = grown;
+                dummy_layer_tile_size = required_size;
+            }
         }
-        cur_y += 16;
-        cur_tile_y++;
-    } while (cur_y < 320);
+        if (dummy_layer_tile_data) {
+            memset(dummy_layer_tile_data, 0, dummy_layer_tile_size);
+            *pTileData = dummy_layer_tile_data;
+        }
+    }
+
+    if (*pTileData) {
+        SO_CONTINUE_VOID(hook_layer_draw, self, screen_x, screen_y, tile_pt, arg4, draw_op, arg6);
+    }
+
+    if (!old_tileData) {
+        *pTileData = NULL;
+    }
+}
+
+/*
+ * Diagnostic-only passthrough for CMvObjectMgr::Draw(EnumObjectLayer, bool).
+ * _ZN12CMvObjectMgr4DrawE15EnumObjectLayerb
+ *
+ * The CMvLayer::Draw fix above stopped terrain from being force-blanked by a
+ * null tile-attribute buffer, but user report after that fix (game_042.log)
+ * is unchanged: terrain, player and NPCs still don't render anywhere, only
+ * background + touch UI show. CMvObjectMgr::Draw is the function that
+ * actually iterates and draws every player/NPC object -- verified via
+ * arm-vita-eabi-objdump at 0x9b654 that for a given layer it reads a
+ * registered-object count from `self + layer*0x10 + 0x6c` and an object
+ * pointer array from `self + (layer+6)*0x10 + 8`, calling CMvObject::Draw()
+ * on each non-null entry. This is a PRISTINE, unhooked function (no patch
+ * touches it) -- so if nothing draws, either (a) the count is 0 for every
+ * layer, meaning no player/NPC object was ever registered for rendering at
+ * all (a spawn/creation-side bug, unrelated to the tile-draw fix), or
+ * (b) the count is non-zero but CMvObject::Draw's own return/behavior
+ * still produces nothing on screen (a lower-level sprite-draw issue).
+ * Logs (edge-triggered per layer, capped) the registered count and this
+ * function's own return value (how many objects it believes it drew) so a
+ * fresh session log can distinguish these two cases before patching either.
+ * Pure passthrough, no behavior change.
+ */
+static int objmgr_draw_log_count = 0;
+#define OBJMGR_DRAW_LOG_MAX 90
+static int objmgr_last_count[3] = { -1, -1, -1 };
+
+static int hooked_CMvObjectMgr_Draw(void *self, int layer, int only_visible) {
+    int count = -1;
+    if (self && layer >= 0 && layer < 3) {
+        count = *(int *)((char *)self + layer * 0x10 + 0x6c);
+    }
+    int drawn = SO_CONTINUE(int, hook_objmgr_draw, self, layer, only_visible);
+    if (layer >= 0 && layer < 3 && count != objmgr_last_count[layer] &&
+        objmgr_draw_log_count < OBJMGR_DRAW_LOG_MAX) {
+        objmgr_last_count[layer] = count;
+        objmgr_draw_log_count++;
+        game_log("[ObjMgrDraw] layer=%d registered=%d drawn=%d\n", layer, count, drawn);
+    }
+    return drawn;
+}
+
+/*
+ * Diagnostic-only passthrough for CMvObject::IsDrawable().
+ * _ZN9CMvObject10IsDrawableEv
+ *
+ * game_043.log with the CMvObjectMgr::Draw diagnostic above showed the real
+ * split: cutscene NPC objects (layer 1, e.g. the Princess/Guardian scene)
+ * are correctly REGISTERED (registered=2/3) but CMvObject::Draw returns 0
+ * for them on every single sample (drawn=0 always) -- they exist but are
+ * being told "not drawable" every frame. Meanwhile layer-0 objects during
+ * real in-game play always have drawn==registered (CMvObject::Draw returns
+ * 1), yet the user still reports nothing renders -- so that path's bug, if
+ * any, is further downstream (inside the object's own vtable draw call),
+ * not here.
+ *
+ * CMvObject::Draw only calls IsDrawable() as a real gate for objects whose
+ * type byte (self+4) is NOT one of {6,7,9,10,11,12} (those always draw
+ * unconditionally) -- confirmed via arm-vita-eabi-objdump (0xa38b6-0xa38be
+ * sign-extends self+4 and compares against that set). IsDrawable() itself
+ * (0xa3870, verified via objdump, not just Ghidra pseudo-C -- the Ghidra
+ * dump was cross-checked and matches here) returns false immediately if
+ * self+24 (signed short) == -1, or if self+29 (byte) == 0; otherwise it
+ * reads screen bounds from the CMvGraphics singleton (confirmed via GOT/
+ * relocation cross-reference against the known ms_pSingleton table at
+ * 0x15f2ec = CGsSingleton<CMvGraphics>::ms_pSingleton, not guessed) and
+ * finally calls CMvObject::IsInScreen(x,y) -> CGsGraphics::CheckRectInScreen.
+ * Logs (once per distinct failing object pointer, capped) the raw
+ * self+24/self+29/self+31 values whenever this returns 0, to localize which
+ * of these gates is rejecting the cutscene actors before touching any of
+ * them. Pure passthrough, no behavior change.
+ *
+ * ROUND 2 (game_044.log): first log with this hook showed a real 3-way
+ * split -- self=...024c (type=13, byteAt29=0) is rejected by the CHEAP
+ * early gate (a legitimate "not ready yet" state, probably harmless), but
+ * self=...1bac (type=0, byteAt29=1, byteAt31=31) and self=...441c (type=5,
+ * byteAt29=1, byteAt31=0) both PASS both early gates and still get
+ * rejected -- proving the CMvGraphics/camera on-screen check itself is
+ * where real NPC objects die. Per the disassembly (0xa3884-0xa3898):
+ * `self+31 == 0` sends the object straight into `IsInScreen(0,0)` --
+ * checking the object's screen rect against world ORIGIN instead of the
+ * real camera scroll offset -- which will read as "off-screen" for any
+ * object whose screen position isn't near (0,0). Added the extra fields
+ * below (self+0x2a/0x2c = the object's own already-computed screen X/Y,
+ * written by UpdateScreenPosFromWorldPos before this check; and the
+ * CMvGraphics/camera chain fields IsDrawable itself reads) to see exactly
+ * how far off (0,0) the rejected objects' screen position is, and whether
+ * self+31==0 or a false CMvGraphics+8!=2 is what's forcing the (0,0)
+ * fallback path for each one. Read-only, no behavior change.
+ */
+static int is_drawable_log_count = 0;
+#define IS_DRAWABLE_LOG_MAX 60
+static void *is_drawable_seen[16];
+static int is_drawable_seen_n = 0;
+
+static int hooked_CMvObject_IsDrawable(void *self) {
+    int result = SO_CONTINUE(int, hook_is_drawable, self);
+    if (!self || result != 0 || is_drawable_log_count >= IS_DRAWABLE_LOG_MAX) {
+        return result;
+    }
+    for (int i = 0; i < is_drawable_seen_n; i++) {
+        if (is_drawable_seen[i] == self) return result;
+    }
+    if (is_drawable_seen_n < 16) {
+        is_drawable_seen[is_drawable_seen_n++] = self;
+    }
+    int16_t shortAt24 = *(int16_t *)((char *)self + 24);
+    uint8_t byteAt29 = *(uint8_t *)((char *)self + 29);
+    uint8_t byteAt31 = *(uint8_t *)((char *)self + 31);
+    int8_t type = *(int8_t *)((char *)self + 4);
+    int16_t screenX = *(int16_t *)((char *)self + 0x2a);
+    int16_t screenY = *(int16_t *)((char *)self + 0x2c);
+
+    int graphicsMode = 0, camFlag = 0, camX = 0, camY = 0;
+    void **pGraphicsSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI11CMvGraphicsE13ms_pSingletonE");
+    if (pGraphicsSingleton && *pGraphicsSingleton) {
+        char *pGraphics = (char *)*pGraphicsSingleton;
+        graphicsMode = *(int *)(pGraphics + 8);
+        void *pCamera = *(void **)(pGraphics + 12);
+        if (pCamera) {
+            camFlag = *(uint8_t *)((char *)pCamera + 28);
+            camX = *(int *)((char *)pCamera + 20);
+            camY = *(int *)((char *)pCamera + 24);
+        }
+    }
+
+    /* CMvObject::IsInScreen (0xa36c8) reads CGsSingleton<CMvMap>::ms_pSingleton
+     * + 0xac/0xae (signed shorts) -- resolved via GOT/relocation trace,
+     * confirmed against 0x15f2dc = CGsSingleton<CMvMap>::ms_pSingleton in the
+     * nm -D symbol table, not guessed. CORRECTION (round 7): re-tracing
+     * IsInScreen -> CGsGraphics::CheckRectInScreen in full showed these two
+     * values are NOT the screen bounds themselves -- they're passed as the
+     * two additive `int` offset args into CheckRectInScreen(rect, a, b),
+     * added to the REAL bounds which live on the (different) CGsGraphics
+     * singleton at +0x3c/+0x4c/+0x50. So `mapViewWH == (0,0)` observed live
+     * is very likely a harmless "no extra offset" case, not the bug --
+     * logged here for completeness/context, but see hooked_CheckRectInScreen
+     * below for the actual ground-truth instrumentation of the real
+     * pass/fail decision instead of hand-deriving it further. */
+    int mapViewW = -1, mapViewH = -1;
+    void **pMapSingletonDiag = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI6CMvMapE13ms_pSingletonE");
+    if (pMapSingletonDiag && *pMapSingletonDiag) {
+        char *pMap = (char *)*pMapSingletonDiag;
+        mapViewW = *(int16_t *)(pMap + 0xac);
+        mapViewH = *(int16_t *)(pMap + 0xae);
+    }
+
+    is_drawable_log_count++;
+    game_log("[IsDrawable] self=%p type=%d shortAt24=%d byteAt29=%d byteAt31=%d "
+             "screenXY=(%d,%d) graphicsMode=%d camFlag=%d camXY=(%d,%d) mapViewWH=(%d,%d) -> NOT drawable\n",
+        self, (int)type, (int)shortAt24, (int)byteAt29, (int)byteAt31,
+        (int)screenX, (int)screenY, graphicsMode, camFlag, camX, camY, mapViewW, mapViewH);
+    return result;
+}
+
+/*
+ * Diagnostic-only passthrough for CGsGraphics::CheckRectInScreen(TGXRECT, int, int).
+ * _ZN11CGsGraphics17CheckRectInScreenE7TGXRECTii
+ *
+ * This is the actual, final pass/fail comparison behind every IsDrawable()
+ * rejection traced so far -- rather than keep hand-deriving its internal
+ * algebra from static disassembly (already caught one wrong turn this round:
+ * the CMvMap+0xac/0xae fields logged above turned out to be an additive
+ * offset passed INTO this call, not the screen bounds themselves), hook the
+ * function directly and log its real runtime inputs and output. Confirmed
+ * via arm-vita-eabi-objdump (0x6f610) that this reads its actual screen
+ * bounds from `this` (the CGsGraphics singleton, 0x15f128 in the nm -D
+ * table, confirmed via the same GOT-trace technique) at +0x3c/+0x4c/+0x50 --
+ * also confirmed (0x70a38 CGsGraphics::Initialize, 0x70b10
+ * CGsGraphics::CGsGraphics ctor, 0xc7f1c inside CMvGraphics::CMvGraphics)
+ * that +0x3c is hardcoded to literal 0 by the PRISTINE original ARM
+ * constructor chain (not something this port broke) -- so if the real bug
+ * is here, it's in +0x4c/+0x50 or in how the rect/offset args compare
+ * against them, not a simple "screen size is 0" story. TGXRECT is an 8-byte
+ * (4x int16) struct passed by value in r1/r2 per AAPCS, matched here with a
+ * plain 4-short struct so the compiler decodes the same registers the
+ * pristine caller already set up. Rate-limited to failures only (returns
+ * 0), capped. Pure passthrough, no behavior change.
+ */
+typedef struct { int16_t x0, y0, x1, y1; } TGXRECT8;
+
+static int check_rect_log_count = 0;
+#define CHECK_RECT_LOG_MAX 40
+
+static int hooked_CheckRectInScreen(void *self, TGXRECT8 rect, int a, int b) {
+    int result = SO_CONTINUE(int, hook_check_rect_in_screen, self, rect, a, b);
+    if (result != 0 || !self || check_rect_log_count >= CHECK_RECT_LOG_MAX) {
+        return result;
+    }
+    check_rect_log_count++;
+    int32_t bound3c = *(int32_t *)((char *)self + 0x3c);
+    int32_t bound4c = *(int32_t *)((char *)self + 0x4c);
+    int32_t bound50 = *(int32_t *)((char *)self + 0x50);
+    game_log("[CheckRectInScreen] rect=(%d,%d,%d,%d) a=%d b=%d bound3c=%d bound4c=%d bound50=%d -> false\n",
+        (int)rect.x0, (int)rect.y0, (int)rect.x1, (int)rect.y1, a, b, bound3c, bound4c, bound50);
+    return result;
 }
 
 /*
@@ -1201,29 +1394,29 @@ static uint16_t hooked_CMvObject_GetTileAttr(void *obj, int tx, int ty) {
     if (!pMapSingleton || !*pMapSingleton) return 1;
     char *map = (char *)*pMapSingleton;
 
+    void *layers = *(void **)(map + 0xf0);
+    if (!layers) return 1;
+    
+    uint8_t *tileData = get_main_tile_data(map);
+    int map_h = *(int *)(map + 0xe0);
+
+    if (!tileData) {
+        if (ty >= 14) return 1;
+        return 0;
+    }
+
     int layer_count = *(int *)(map + 0xd8);
     int map_w = *(int *)(map + 0xdc);
-    int map_h = *(int *)(map + 0xe0);
 
     if (layer_count < 1 || tx < 0 || tx >= map_w || ty < 0 || ty >= map_h) {
         return 1;
     }
-
-    void *layers = *(void **)(map + 0xf0);
-    if (!layers) return 1;
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData) return 1;
 
     int tile_idx = (ty * map_w + tx) * 3;
     uint8_t f1 = tileData[tile_idx + 1];
     uint8_t f2 = tileData[tile_idx + 2];
     return (uint16_t)f1 | ((uint16_t)f2 << 8);
 }
-
-/*
- * Hook for FUN_0009b9f8 / CMvObjectMgr GetTileAttr for Object (during DoMapChange)
- * Located at text_base + 0x0009b9f8
- */
 static uint16_t hooked_GetTileAttr_Obj(void *obj) {
     if (!obj) return 1;
     uint8_t tx = *(uint8_t *)((char *)obj + 0x26);
@@ -1233,23 +1426,27 @@ static uint16_t hooked_GetTileAttr_Obj(void *obj) {
     if (!pMapSingleton || !*pMapSingleton) return 1;
     char *map = (char *)*pMapSingleton;
 
-    int layer_count = *(int *)(map + 0xd8);
-    int map_w = *(int *)(map + 0xdc);
-    int map_h = *(int *)(map + 0xe0);
-
-    if (layer_count < 1 || tx >= map_w || ty >= map_h) return 1;
-
     void *layers = *(void **)(map + 0xf0);
     if (!layers) return 1;
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
-    if (!tileData) return 1;
+    
+    uint8_t *tileData = get_main_tile_data(map);
+    int map_h = *(int *)(map + 0xe0);
+
+    if (!tileData) {
+        if (ty >= 14) return 1;
+        return 0;
+    }
+
+    int layer_count = *(int *)(map + 0xd8);
+    int map_w = *(int *)(map + 0xdc);
+
+    if (layer_count < 1 || tx >= map_w || ty >= map_h) return 1;
 
     int tile_idx = (ty * map_w + tx) * 3;
     uint8_t f1 = tileData[tile_idx + 1];
     uint8_t f2 = tileData[tile_idx + 2];
     return (uint16_t)f1 | ((uint16_t)f2 << 8);
 }
-
 /*
  * Hook for CMvObject::AddOccupyAttrib(int tx, int ty, uint16_t attrib)
  * _ZN9CMvObject15AddOccupyAttribEiit
@@ -1269,7 +1466,7 @@ static void hooked_CMvObject_AddOccupyAttrib(void *self, int tx, int ty, uint16_
     if (layer_count > 0 && tx >= 0 && tx < map_w && ty >= 0 && ty < map_h) {
         void *layers = *(void **)(map + 0xf0);
         if (layers) {
-            uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
+    uint8_t *tileData = get_main_tile_data(map);
             if (tileData) {
                 int tile_idx = (ty * map_w + tx) * 3;
                 uint16_t cur = (uint16_t)tileData[tile_idx + 1] | ((uint16_t)tileData[tile_idx + 2] << 8);
@@ -1307,7 +1504,7 @@ static void hooked_CMvObject_DelOccupyAttrib(void *self, int tx, int ty, uint16_
     if (layer_count > 0 && tx >= 0 && tx < map_w && ty >= 0 && ty < map_h) {
         void *layers = *(void **)(map + 0xf0);
         if (layers) {
-            uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
+    uint8_t *tileData = get_main_tile_data(map);
             if (tileData) {
                 int tile_idx = (ty * map_w + tx) * 3;
                 uint16_t cur = (uint16_t)tileData[tile_idx + 1] | ((uint16_t)tileData[tile_idx + 2] << 8);
@@ -1345,7 +1542,7 @@ static void hooked_CMvMapObject_DelOccupyAttribSize(void *self, uint16_t attrib)
 
     void *layers = *(void **)(map + 0xf0);
     if (!layers) return;
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
+    uint8_t *tileData = get_main_tile_data(map);
     if (!tileData) return;
 
     uint8_t cx = *(uint8_t *)((char *)self + 0x26);
@@ -1404,234 +1601,46 @@ static void hooked_CMvPlayer_SetHonorProgress(void *self, int honor_type, int pr
  * Hook for CMvMap::Draw()
  * _ZN6CMvMap4DrawEv
  */
+/*
+ * Diagnostic (edge-triggered, no cap): the real CMvMap::Draw (verified via
+ * arm-vita-eabi-objdump, not just the Ghidra pseudo-C) gates its ENTIRE body
+ * -- both the cutscene CMvScrollBG::DrawH path and the normal tile-layer +
+ * CMvObjectMgr::Draw path that renders terrain/player/NPCs -- on self+0xc8
+ * (aka "pTileImages" in these hooks) being non-null. That field is written
+ * only by CMvMap::LoadTileImage(int), via MvLoadPzx("map/%03d.pzx", id).
+ * User report: terrain, player and NPCs all missing (only background+touch
+ * UI show) after a map transition, camera-follow and text still working.
+ * This logs every time the draw state changes for the current map (not
+ * every frame) so a single captured session shows: which map ids reach
+ * NORMAL (tiles+objects) rendering, which stay BLOCKED forever (pTileImages
+ * never got populated for that map -- see the LoadTileImage hook below for
+ * why), and whether SCROLLBG cutscene mode ever hands off to NORMAL mode at
+ * all during a map transition.
+ */
+static int mapdraw_state_log_count = 0;
+#define MAPDRAW_STATE_LOG_MAX 200
+
 static void hooked_CMvMap_Draw(void *self) {
     if (!self) return;
+    void *layers = *(void **)((char *)self + 0xf0);
+    if (!layers) return;
+
+    void *pTileImagesDiag = *(void **)((char *)self + 200);
+    void *scrollBGDiag = *(void **)((char *)self + 0xf4);
+    static int last_logged_mapdraw_state = -1;
+    int mapdraw_state = !pTileImagesDiag ? 0 : (scrollBGDiag ? 1 : 2);
+    if (mapdraw_state != last_logged_mapdraw_state && mapdraw_state_log_count < MAPDRAW_STATE_LOG_MAX) {
+        last_logged_mapdraw_state = mapdraw_state;
+        mapdraw_state_log_count++;
+        game_log("[MapDraw] state -> %s (map_id=%d pTileImages=%p scrollBG=%p)\n",
+            mapdraw_state == 0 ? "BLOCKED(pTileImages NULL)" :
+            mapdraw_state == 1 ? "SCROLLBG(cutscene)" : "NORMAL(tiles+objects)",
+            (int)*(uint8_t *)((char *)self + 4), pTileImagesDiag, scrollBGDiag);
+    }
+
     if (*(int *)((char *)self + 200) == 0) return;
 
-    int is_dark = *(uint8_t *)((char *)self + 0x360);
-
-    typedef void (*ClearScreenFunc)(void *this, uint32_t col);
-    typedef void *(*GetTblFunc)(void *this, int id);
-    typedef int (*GetValFunc)(void *this, int col, int row);
-    typedef void (*DrawColorGradationRectFunc)(void *this, int x, int y, int w, int h, int dir, uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2);
-    typedef void (*DrawHFunc)(void *this, int x, int y);
-    typedef void (*DrawCloudFunc)(void *this);
-    typedef void (*DrawWeatherFunc)(int type);
-    typedef void (*PrepareLightFunc)(void *this, int val);
-    typedef int (*GetShakeOffFunc)(void *this);
-    typedef void (*ParticleDrawFunc)(void *this, int layer, int b);
-    typedef void (*PaletteFunc)(void *this, void *bitmap);
-    typedef void (*ObjMgrDrawFunc)(void *this, int layer, int b);
-    typedef void (*DrawMapChangeZoneEffectFunc)(void *this);
-    typedef void (*DrawBackupScreenFunc)(void *this, int arg1, int arg2);
-    typedef int (*GetSkillLVFunc)(void *this, int skill);
-    typedef int (*GetUpAndDownCountFunc)(int v, int max, int step);
-    typedef void (*DrawScreenMosaicFunc)(void *this, int val, int mode);
-    typedef void (*PlayerAreaFunc)(void *this, int val);
-
-    void **pGraphicsSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI11CGsGraphicsE13ms_pSingletonE");
-    void *pGraphics = pGraphicsSingleton ? *pGraphicsSingleton : NULL;
-
-    void *scrollBG = *(void **)((char *)self + 0xf4);
-    if (!scrollBG) {
-        if (*(int *)((char *)self + 0xe4) == 7) {
-            ClearScreenFunc ClearScreen = (ClearScreenFunc)so_symbol(&so_mod, "_ZN11CGsGraphics11ClearScreenEj");
-            if (ClearScreen && pGraphics) ClearScreen(pGraphics, 0);
-        } else {
-            uint8_t map_id = *(uint8_t *)((char *)self + 4);
-            void **pXlsMgr = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI9CMvXlsMgrE13ms_pSingletonE");
-            GetTblFunc GetTbl = (GetTblFunc)so_symbol(&so_mod, "_ZN9CMvXlsMgr6GetTblEi");
-            GetValFunc GetVal = (GetValFunc)so_symbol(&so_mod, "_ZN10GVXLLoader6GetValEii");
-            if (pXlsMgr && *pXlsMgr && GetTbl && GetVal) {
-                void *tbl = GetTbl(*pXlsMgr, 10);
-                int val = GetVal(tbl, 2, (int)map_id);
-                int idx = val * 3;
-                if (idx >= 0 && idx + 2 < 0x18) {
-                    uint8_t *dat0 = (uint8_t *)((char *)so_mod.text_base + 0x13f900);
-                    uint8_t *dat1 = (uint8_t *)((char *)so_mod.text_base + 0x13f918);
-                    DrawColorGradationRectFunc DrawGrad = (DrawColorGradationRectFunc)so_symbol(&so_mod, "_ZN11CGsGraphics22DrawColorGradationRectEiiiiNS_7EnumDirEhhhhhh");
-                    if (DrawGrad && pGraphics) {
-                        DrawGrad(pGraphics, 0, 0, 480, 320, 1, dat0[idx], dat0[idx+1], dat0[idx+2], dat1[idx], dat1[idx+1], dat1[idx+2]);
-                    }
-                }
-            }
-        }
-    } else {
-        int map_h = *(int *)((char *)self + 0xe0);
-        int16_t off_y = *(int16_t *)((char *)self + 0xae);
-        ClearScreenFunc ClearScreen = (ClearScreenFunc)so_symbol(&so_mod, "_ZN11CGsGraphics11ClearScreenEj");
-        if (ClearScreen && pGraphics) ClearScreen(pGraphics, 0);
-
-        GetShakeOffFunc GetShakeOffX = (GetShakeOffFunc)so_symbol(&so_mod, "_ZN6CMvMap12GetShakeOffXEv");
-        GetShakeOffFunc GetShakeOffY = (GetShakeOffFunc)so_symbol(&so_mod, "_ZN6CMvMap12GetShakeOffYEv");
-        int sx = GetShakeOffX ? GetShakeOffX(self) : 0;
-        int sy = GetShakeOffY ? GetShakeOffY(self) : 0;
-        DrawHFunc DrawH = (DrawHFunc)so_symbol(&so_mod, "_ZN11CMvScrollBG5DrawHEii");
-        if (DrawH) {
-            DrawH(scrollBG, sx, sy + (((map_h * 16 - 320) - off_y) >> 2));
-        }
-    }
-
-    void **pMvGraphicsSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI11CMvGraphicsE13ms_pSingletonE");
-    void *pMvGraphics = pMvGraphicsSingleton ? *pMvGraphicsSingleton : NULL;
-
-    if (!is_dark) {
-        DrawCloudFunc DrawCloud = (DrawCloudFunc)so_symbol(&so_mod, "_ZN6CMvMap9DrawCloudEv");
-        if (DrawCloud) DrawCloud(self);
-    }
-
-    if (pMvGraphics && *(int *)((char *)pMvGraphics + 8) == 2) {
-        DrawWeatherFunc DrawBottomWeather = (DrawWeatherFunc)so_symbol(&so_mod, "_Z23DrawBottomWeatherEffect15EnumWeatherType");
-        if (DrawBottomWeather) DrawBottomWeather(*(int *)((char *)self + 0xec));
-    }
-
-    PrepareLightFunc PrepareLight = (PrepareLightFunc)so_symbol(&so_mod, "_ZN11CMvGraphics12PrepareLightEi");
-    if (PrepareLight && pMvGraphics) PrepareLight(pMvGraphics, *(int *)((char *)self + 0xe8));
-
-    uint8_t tpx = *(uint8_t *)((char *)self + 0x304);
-    int16_t tx_off = *(int16_t *)((char *)self + 0xac);
-    uint8_t tpy = *(uint8_t *)((char *)self + 0x305);
-    int16_t ty_off = *(int16_t *)((char *)self + 0xae);
-
-    GetShakeOffFunc GetShakeOffX = (GetShakeOffFunc)so_symbol(&so_mod, "_ZN6CMvMap12GetShakeOffXEv");
-    GetShakeOffFunc GetShakeOffY = (GetShakeOffFunc)so_symbol(&so_mod, "_ZN6CMvMap12GetShakeOffYEv");
-    int shake_x = GetShakeOffX ? GetShakeOffX(self) : 0;
-    int shake_y = GetShakeOffY ? GetShakeOffY(self) : 0;
-
-    int render_x = (int)tpx * 16 - (int)tx_off + shake_x;
-    int render_y = (int)tpy * 16 - (int)ty_off + shake_y;
-
-    void **pParticleMgr = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI16CGsParticleMgrExE13ms_pSingletonE");
-    ParticleDrawFunc ParticleDraw = (ParticleDrawFunc)so_symbol(&so_mod, "_ZN16CGsParticleMgrEx4DrawEib");
-    if (ParticleDraw && pParticleMgr && *pParticleMgr) {
-        ParticleDraw(*pParticleMgr, 0, 1);
-    }
-
-    void *tile_images = *(void **)((char *)self + 200);
-    void *img_bitmap = NULL;
-    if (tile_images && (uintptr_t)tile_images >= 0x80000000) {
-        void *p8 = *(void **)((char *)tile_images + 8);
-        if (p8 && (uintptr_t)p8 >= 0x80000000) {
-            void *p8_8 = *(void **)((char *)p8 + 8);
-            if (p8_8 && (uintptr_t)p8_8 >= 0x80000000) {
-                img_bitmap = *(void **)p8_8;
-            }
-        }
-    }
-
-    PaletteFunc PaletteBackup = (PaletteFunc)so_symbol(&so_mod, "_ZN6CMvMap13PaletteBackupEP12CGxPZxBitmap");
-    PaletteFunc PaletteFadeOut = (PaletteFunc)so_symbol(&so_mod, "_ZN6CMvMap14PaletteFadeOutEP12CGxPZxBitmap");
-    PaletteFunc PaletteRestore = (PaletteFunc)so_symbol(&so_mod, "_ZN6CMvMap14PaletteRestoreEP12CGxPZxBitmap");
-
-    if (PaletteBackup && img_bitmap) PaletteBackup(self, img_bitmap);
-    if (PaletteFadeOut && img_bitmap) PaletteFadeOut(self, img_bitmap);
-
-    void *tile_pt = (void *)((char *)self + 0x304);
-    void *layers = *(void **)((char *)self + 0xf0);
-
-    void **pObjMgrSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI12CMvObjectMgrE13ms_pSingletonE");
-    void *pObjMgr = pObjMgrSingleton ? *pObjMgrSingleton : NULL;
-    ObjMgrDrawFunc ObjMgrDraw = (ObjMgrDrawFunc)so_symbol(&so_mod, "_ZN12CMvObjectMgr4DrawE15EnumObjectLayerb");
-
-    if (layers) {
-        hooked_CMvLayer_Draw(layers, render_x, render_y, tile_pt, 0, 0, 0);
-    }
-    if (ObjMgrDraw && pObjMgr) ObjMgrDraw(pObjMgr, 0, 0);
-    if (ParticleDraw && pParticleMgr && *pParticleMgr) ParticleDraw(*pParticleMgr, 1, 1);
-
-    if (layers) {
-        hooked_CMvLayer_Draw((char *)layers + 24, render_x, render_y, tile_pt, 0, 0, 0);
-    }
-    if (ObjMgrDraw && pObjMgr) ObjMgrDraw(pObjMgr, 1, 0);
-    if (ParticleDraw && pParticleMgr && *pParticleMgr) ParticleDraw(*pParticleMgr, 2, 1);
-
-    DrawMapChangeZoneEffectFunc DrawMapChangeZoneEffect = (DrawMapChangeZoneEffectFunc)so_symbol(&so_mod, "_ZN6CMvMap23DrawMapChangeZoneEffectEv");
-    if (DrawMapChangeZoneEffect) DrawMapChangeZoneEffect(self);
-
-    int under_flag = 0;
-    void *pPlayer = pObjMgr ? *(void **)((char *)pObjMgr + 8) : NULL;
-    if (pPlayer) {
-        uint8_t px = *(uint8_t *)((char *)pPlayer + 0x26);
-        uint8_t py = *(uint8_t *)((char *)pPlayer + 0x27);
-        int map_w = *(int *)((char *)self + 0xdc);
-        int map_h = *(int *)((char *)self + 0xe0);
-        int layer_count = *(int *)((char *)self + 0xd8);
-        if (layer_count > 0 && px < map_w && py < map_h && layers) {
-            uint8_t *layer0_tile = *(uint8_t **)((char *)layers + 12);
-            if (layer0_tile) {
-                under_flag = layer0_tile[(py * map_w + px) * 3 + 2] & 1;
-            }
-        }
-    }
-
-    int skill_level = -1;
-    if (*(uint8_t *)((char *)self + 0x34c) == 0) {
-        int screenEffCounter = *(int *)((char *)self + 0x354);
-        /* Original: (0 < val) && (-1 < val << 0x1f) — the shift isolates val's
-         * LSB, so this only fires while the counter is a positive EVEN value. */
-        if (screenEffCounter > 0 && !(screenEffCounter & 1)) {
-            void **pEffMgr = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI15CGsScreenEffMgrE13ms_pSingletonE");
-            DrawBackupScreenFunc DrawBackup = (DrawBackupScreenFunc)so_symbol(&so_mod, "_ZN15CGsScreenEffMgr16DrawBackupScreenEii");
-            if (DrawBackup && pEffMgr && *pEffMgr) DrawBackup(*pEffMgr, 1, 6);
-        }
-        if (pObjMgr) {
-            void *p10 = *(void **)((char *)pObjMgr + 0x10);
-            GetSkillLVFunc GetSkillLV = (GetSkillLVFunc)so_symbol(&so_mod, "_ZN15CMvSpriteObject10GetSkillLVE15EnumSpriteSkill");
-            if (GetSkillLV && p10) skill_level = GetSkillLV(p10, 2);
-        }
-    } else {
-        if (pMvGraphics) {
-            int counter = *(int *)((char *)pMvGraphics + 0x18) + 1;
-            *(int *)((char *)pMvGraphics + 0x18) = counter;
-            GetUpAndDownCountFunc GetCount = (GetUpAndDownCountFunc)so_symbol(&so_mod, "_Z17GetUpAndDownCountiii");
-            DrawScreenMosaicFunc DrawMosaic = (DrawScreenMosaicFunc)so_symbol(&so_mod, "_ZN11CMvGraphics16DrawScreenMosaicEii");
-            int c = GetCount ? GetCount(counter, 6, 4) : 0;
-            if (DrawMosaic) DrawMosaic(pMvGraphics, c, 3);
-        }
-        if (pObjMgr) {
-            void *p10 = *(void **)((char *)pObjMgr + 0x10);
-            GetSkillLVFunc GetSkillLV = (GetSkillLVFunc)so_symbol(&so_mod, "_ZN15CMvSpriteObject10GetSkillLVE15EnumSpriteSkill");
-            if (GetSkillLV && p10) skill_level = GetSkillLV(p10, 2);
-        }
-    }
-
-    int circle_radius = (skill_level == -1) ? 50 : 65;
-
-    if (under_flag == 0) {
-        if (layers) {
-            hooked_CMvLayer_Draw((char *)layers + 48, render_x, render_y, tile_pt, 0, 0, 0);
-        }
-        if (ObjMgrDraw && pObjMgr) ObjMgrDraw(pObjMgr, 2, 0);
-    } else {
-        PlayerAreaFunc CopyArea = (PlayerAreaFunc)so_symbol(&so_mod, "_ZN9CMvPlayer14CopyScreenAreaEi");
-        PlayerAreaFunc DrawCircle = (PlayerAreaFunc)so_symbol(&so_mod, "_ZN9CMvPlayer20DrawCircleScreenAreaEi");
-        if (CopyArea && pPlayer) CopyArea(pPlayer, circle_radius);
-        if (layers) {
-            hooked_CMvLayer_Draw((char *)layers + 48, render_x, render_y, tile_pt, 0, 0, 0);
-        }
-        if (ObjMgrDraw && pObjMgr) ObjMgrDraw(pObjMgr, 2, 0);
-        if (DrawCircle && pPlayer) DrawCircle(pPlayer, circle_radius);
-    }
-
-    if (ParticleDraw && pParticleMgr && *pParticleMgr) ParticleDraw(*pParticleMgr, 3, 1);
-
-    if (pObjMgr) {
-        hooked_CMvObjectMgr_DrawDamageObject(pObjMgr);
-        hooked_CMvObjectMgr_DrawNpcHeadInfo(pObjMgr);
-    }
-
-    if (PaletteRestore && img_bitmap) PaletteRestore(self, img_bitmap);
-
-    if (!is_dark) {
-        typedef void (*ScreenPaletteScrollFunc)(void *this);
-        ScreenPaletteScrollFunc PaletteScroll = (ScreenPaletteScrollFunc)so_symbol(&so_mod, "_ZN6CMvMap19ScreenPaletteScrollEv");
-        if (PaletteScroll) PaletteScroll(self);
-    }
-
-    if (pMvGraphics && *(int *)((char *)pMvGraphics + 8) == 2) {
-        DrawWeatherFunc DrawTopWeather = (DrawWeatherFunc)so_symbol(&so_mod, "_Z20DrawTopWeatherEffect15EnumWeatherType");
-        if (DrawTopWeather) DrawTopWeather(*(int *)((char *)self + 0xec));
-    }
+    SO_CONTINUE_VOID(hook_map_draw, self);
 }
 
 /*
@@ -1655,7 +1664,7 @@ static int hooked_CMvMap_IsSaveMap(void *self) {
 
     void *layers = *(void **)((char *)self + 0xf0);
     if (!layers) return 0;
-    uint8_t *tileData = *(uint8_t **)((char *)layers + 12);
+    uint8_t *tileData = get_main_tile_data(self);
     if (!tileData) return 0;
 
     int tile_idx = (py * map_w + px) * 3;
@@ -1684,6 +1693,7 @@ static int hooked_CMvMap_IsSaveMap(void *self) {
             }
         }
     }
+    
     return 0;
 }
 
@@ -1706,72 +1716,133 @@ static int hooked_CMvMap_IsSaveMap(void *self) {
 static int move_gate_log_count = 0;
 #define MOVE_GATE_LOG_MAX 50
 
+
+static so_hook hook_char_canmove;
+static int hooked_CMvCharacter_CanMove(void *self, int param_1, int param_2, int param_3, int param_4, int param_5, int param_6, int param_7) {
+    if (!self || (uintptr_t)self < 0x10000) return 0;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return 0; // Abort if layers is completely null
+    int ret = SO_CONTINUE(int, hook_char_canmove, self, param_1, param_2, param_3, param_4, param_5, param_6, param_7);
+    restore_dummy_tile_data(dummy);
+    return ret;
+}
+
 static so_hook hook_char_onmove_1;
 static int hooked_CMvCharacter_OnMove_1(void *self, int param_1) {
-    if (!self || (uintptr_t)self < 0x80000000) return 0;
-    if (!is_map_tiledata_ready()) {
-        if (move_gate_log_count < MOVE_GATE_LOG_MAX) {
-            move_gate_log_count++;
-            game_log("[Move] OnMove_1 blocked: map tiledata not ready (self=%p)\n", self);
-        }
-        return 0;
-    }
-    return SO_CONTINUE(int, hook_char_onmove_1, self, param_1);
+    if (!self || (uintptr_t)self < 0x10000) return 0;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return 0; // Abort if layers is completely null
+    int ret = SO_CONTINUE(int, hook_char_onmove_1, self, param_1);
+    restore_dummy_tile_data(dummy);
+    return ret;
 }
 
 static so_hook hook_char_onmove_5;
 static int hooked_CMvCharacter_OnMove_5(void *self, int dir1, int dir2, int p3, int p4, int p5) {
-    if (!self || (uintptr_t)self < 0x80000000) return 0;
-    if (!is_map_tiledata_ready()) {
-        if (move_gate_log_count < MOVE_GATE_LOG_MAX) {
-            move_gate_log_count++;
-            game_log("[Move] OnMove_5 blocked: map tiledata not ready (self=%p dir1=%d dir2=%d)\n", self, dir1, dir2);
-        }
-        return 0;
-    }
-    return SO_CONTINUE(int, hook_char_onmove_5, self, dir1, dir2, p3, p4, p5);
+    if (!self || (uintptr_t)self < 0x10000) return 0;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return 0; // Abort if layers is completely null
+    int ret = SO_CONTINUE(int, hook_char_onmove_5, self, dir1, dir2, p3, p4, p5);
+    restore_dummy_tile_data(dummy);
+    return ret;
 }
 
 static so_hook hook_set_screen_skill;
 static void hooked_CMvCharacter_SetScreenSkillUsePos(void *self, int *p1, void *p2, int p3) {
-    if (!self || (uintptr_t)self < 0x80000000 || !p1 || !p2) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000 || !p1 || !p2) return;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return; // Abort if layers is completely null
     SO_CONTINUE_VOID(hook_set_screen_skill, self, p1, p2, p3);
+    restore_dummy_tile_data(dummy);
 }
 
 static so_hook hook_wizard_attack;
 static void hooked_CMvPCWizard_DoAttack(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return; // Abort if layers is completely null
     SO_CONTINUE_VOID(hook_wizard_attack, self);
+    restore_dummy_tile_data(dummy);
 }
 
 static so_hook hook_rogue_skill;
 static void hooked_CMvPCRogue_DoSkill(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return; // Abort if layers is completely null
     SO_CONTINUE_VOID(hook_rogue_skill, self);
+    restore_dummy_tile_data(dummy);
 }
+
+/*
+ * Diagnostic: game_038.log showed [MapDraw] briefly reaching NORMAL(tiles+
+ * objects) with a valid pTileImages (refuting the earlier LoadTileImage
+ * theory), then bouncing straight back to SCROLLBG(map_id=2) tied to
+ * script/call/002.zt1 + script/map/002_001.zt1 -- re-read hundreds of times
+ * (output_eng.zt1 alone: 400+ reads) -- with touch.reportNum staying 0 the
+ * whole session. Per the Ghidra decompile, CMvMapObject::OnEvent's case
+ * 0x13 (script/call/NNN.zt1 trigger, self+0x54==0x13, self+0x58==iVar9>0)
+ * calls CMvGameScriptMgr::CreateCallScript() completely unconditionally --
+ * no "already fired"/one-shot flag visible in that case at all. If the
+ * player is stuck standing on this trigger's tile (matches the still-open
+ * "character stuck, no movement" lead), OnEvent would refire the same
+ * call-script every time it's invoked, which would explain the repeating
+ * dialogue reads, the repeating sound the user described, and the
+ * NORMAL/SCROLLBG flicker together as ONE bug instead of three. Logs the
+ * dispatch fields (verified via real disassembly: self+4 signed-byte gate,
+ * self+0x54 switch selector, self+0x58 iVar9 arg) plus the player's tile
+ * (px,py) so the next log shows directly whether the same (case, iVar9,
+ * px, py) repeats call after call (stuck) or actually varies (working as
+ * designed, just a busy scripted area).
+ */
+static int mapobj_onevent_log_count = 0;
+#define MAPOBJ_ONEVENT_LOG_MAX 60
 
 static so_hook hook_map_obj_event;
 static void hooked_CMvMapObject_OnEvent(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
+
+    if (mapobj_onevent_log_count < MAPOBJ_ONEVENT_LOG_MAX) {
+        int8_t gate = *(int8_t *)((char *)self + 4);
+        if (gate == 8) {
+            int event_type = *(int *)((char *)self + 0x54);
+            int arg = *(int *)((char *)self + 0x58);
+            int px = -1, py = -1;
+            void **pObjMgrSingleton = (void **)so_symbol(&so_mod, "_ZN12CGsSingletonI12CMvObjectMgrE13ms_pSingletonE");
+            if (pObjMgrSingleton && *pObjMgrSingleton) {
+                void *pPlayer = *(void **)((char *)*pObjMgrSingleton + 8);
+                if (pPlayer && (uintptr_t)pPlayer >= 0x10000) {
+                    px = *(uint8_t *)((char *)pPlayer + 0x26);
+                    py = *(uint8_t *)((char *)pPlayer + 0x27);
+                }
+            }
+            mapobj_onevent_log_count++;
+            game_log("[MapObjEvent] case=0x%x arg=%d player_tile=(%d,%d)\n", event_type, arg, px, py);
+        }
+    }
+
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return; // Abort if layers is completely null
     SO_CONTINUE_VOID(hook_map_obj_event, self);
+    restore_dummy_tile_data(dummy);
 }
 
 static so_hook hook_ride_rotate_rail;
 static void hooked_CMvMapObjectRideRotate_DoRailSetPos(void *self, int param_1) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return; // Abort if layers is completely null
     SO_CONTINUE_VOID(hook_ride_rotate_rail, self, param_1);
+    restore_dummy_tile_data(dummy);
 }
 
 static so_hook hook_projectile_move;
 static void hooked_CMvProjectile_OnMove(void *self) {
-    if (!self || (uintptr_t)self < 0x80000000) return;
-    if (!is_map_tiledata_ready()) return;
+    if (!self || (uintptr_t)self < 0x10000) return;
+    uint8_t *dummy = swap_dummy_tile_data();
+    if (dummy == (uint8_t *)-1) return; // Abort if layers is completely null
     SO_CONTINUE_VOID(hook_projectile_move, self);
+    restore_dummy_tile_data(dummy);
 }
 
 void so_patch(void) {
@@ -1786,38 +1857,44 @@ void so_patch(void) {
 
     uintptr_t draw_damage = (uintptr_t)so_symbol(&so_mod, "_ZN11CMvGraphics10DrawDamageEiiiiii10enumDrawOPi");
     if (draw_damage) {
-        hook_thumb_func(draw_damage, (uintptr_t)&hooked_CMvGraphics_DrawDamage);
+        hook_draw_damage = hook_thumb(draw_damage | 1, (uintptr_t)&hooked_CMvGraphics_DrawDamage);
         game_log("[Patch] Hooked CMvGraphics::DrawDamage (0x%08X)\n", (unsigned int)draw_damage);
     }
 
     uintptr_t draw_numbers = (uintptr_t)so_symbol(&so_mod, "_ZN11CMvGraphics11DrawNumbersEiiiPKcijbb");
     if (draw_numbers) {
-        hook_thumb_func(draw_numbers, (uintptr_t)&hooked_CMvGraphics_DrawNumbers);
+        hook_draw_numbers = hook_thumb(draw_numbers | 1, (uintptr_t)&hooked_CMvGraphics_DrawNumbers);
         game_log("[Patch] Hooked CMvGraphics::DrawNumbers (0x%08X)\n", (unsigned int)draw_numbers);
     }
 
     uintptr_t num_draw = (uintptr_t)so_symbol(&so_mod, "_ZN15CMvNumberObject4DrawEv");
     if (num_draw) {
-        hook_thumb_func(num_draw, (uintptr_t)&hooked_CMvNumberObject_Draw);
+        hook_num_draw = hook_thumb(num_draw | 1, (uintptr_t)&hooked_CMvNumberObject_Draw);
         game_log("[Patch] Hooked CMvNumberObject::Draw (0x%08X)\n", (unsigned int)num_draw);
     }
 
     uintptr_t draw_damage_obj = (uintptr_t)so_symbol(&so_mod, "_ZN12CMvObjectMgr16DrawDamageObjectEv");
     if (draw_damage_obj) {
-        hook_thumb_func(draw_damage_obj, (uintptr_t)&hooked_CMvObjectMgr_DrawDamageObject);
+        hook_draw_damage_obj = hook_thumb(draw_damage_obj | 1, (uintptr_t)&hooked_CMvObjectMgr_DrawDamageObject);
         game_log("[Patch] Hooked CMvObjectMgr::DrawDamageObject (0x%08X)\n", (unsigned int)draw_damage_obj);
     }
 
     uintptr_t draw_npc_head = (uintptr_t)so_symbol(&so_mod, "_ZN12CMvObjectMgr15DrawNpcHeadInfoEv");
     if (draw_npc_head) {
-        hook_thumb_func(draw_npc_head, (uintptr_t)&hooked_CMvObjectMgr_DrawNpcHeadInfo);
+        hook_draw_npc_head = hook_thumb(draw_npc_head | 1, (uintptr_t)&hooked_CMvObjectMgr_DrawNpcHeadInfo);
         game_log("[Patch] Hooked CMvObjectMgr::DrawNpcHeadInfo (0x%08X)\n", (unsigned int)draw_npc_head);
     }
 
     uintptr_t create_minimap = (uintptr_t)so_symbol(&so_mod, "_ZN6CMvMap13CreateMiniMapEv");
     if (create_minimap) {
-        hook_thumb_func(create_minimap, (uintptr_t)&hooked_CreateMiniMap);
+        hook_create_minimap = hook_thumb(create_minimap | 1, (uintptr_t)&hooked_CreateMiniMap);
         game_log("[Patch] Hooked CMvMap::CreateMiniMap (0x%08X)\n", (unsigned int)create_minimap);
+    }
+
+    uintptr_t load_tile_image = (uintptr_t)so_symbol(&so_mod, "_ZN6CMvMap13LoadTileImageEi");
+    if (load_tile_image) {
+        hook_load_tile_image = hook_thumb(load_tile_image | 1, (uintptr_t)&hooked_CMvMap_LoadTileImage);
+        game_log("[Patch] Hooked CMvMap::LoadTileImage (0x%08X)\n", (unsigned int)load_tile_image);
     }
 
     uintptr_t draw_minimap = (uintptr_t)so_symbol(&so_mod, "_ZN6CMvMap11DrawMiniMapEv");
@@ -1828,8 +1905,14 @@ void so_patch(void) {
 
     uintptr_t map_draw = (uintptr_t)so_symbol(&so_mod, "_ZN6CMvMap4DrawEv");
     if (map_draw) {
-        hook_thumb_func(map_draw, (uintptr_t)&hooked_CMvMap_Draw);
+        hook_map_draw = hook_thumb(map_draw | 1, (uintptr_t)&hooked_CMvMap_Draw);
         game_log("[Patch] Hooked CMvMap::Draw (0x%08X)\n", (unsigned int)map_draw);
+    }
+
+    uintptr_t scrollbg_drawh = (uintptr_t)so_symbol(&so_mod, "_ZN11CMvScrollBG5DrawHEii");
+    if (scrollbg_drawh) {
+        hook_scrollbg_drawh = hook_thumb(scrollbg_drawh | 1, (uintptr_t)&hooked_CMvScrollBG_DrawH);
+        game_log("[Patch] Hooked CMvScrollBG::DrawH (0x%08X)\n", (unsigned int)scrollbg_drawh);
     }
 
     uintptr_t is_save_map = (uintptr_t)so_symbol(&so_mod, "_ZN6CMvMap9IsSaveMapEv");
@@ -1840,8 +1923,26 @@ void so_patch(void) {
 
     uintptr_t layer_draw = (uintptr_t)so_symbol(&so_mod, "_ZN8CMvLayer4DrawEiiP12tagTILEPOINTb10enumDrawOPi");
     if (layer_draw) {
-        hook_thumb_func(layer_draw, (uintptr_t)&hooked_CMvLayer_Draw);
+        hook_layer_draw = hook_thumb(layer_draw | 1, (uintptr_t)&hooked_CMvLayer_Draw);
         game_log("[Patch] Hooked CMvLayer::Draw (0x%08X)\n", (unsigned int)layer_draw);
+    }
+
+    uintptr_t objmgr_draw = (uintptr_t)so_symbol(&so_mod, "_ZN12CMvObjectMgr4DrawE15EnumObjectLayerb");
+    if (objmgr_draw) {
+        hook_objmgr_draw = hook_thumb(objmgr_draw | 1, (uintptr_t)&hooked_CMvObjectMgr_Draw);
+        game_log("[Patch] Hooked CMvObjectMgr::Draw(EnumObjectLayer,bool) (0x%08X)\n", (unsigned int)objmgr_draw);
+    }
+
+    uintptr_t is_drawable = (uintptr_t)so_symbol(&so_mod, "_ZN9CMvObject10IsDrawableEv");
+    if (is_drawable) {
+        hook_is_drawable = hook_thumb(is_drawable | 1, (uintptr_t)&hooked_CMvObject_IsDrawable);
+        game_log("[Patch] Hooked CMvObject::IsDrawable (0x%08X)\n", (unsigned int)is_drawable);
+    }
+
+    uintptr_t check_rect = (uintptr_t)so_symbol(&so_mod, "_ZN11CGsGraphics17CheckRectInScreenE7TGXRECTii");
+    if (check_rect) {
+        hook_check_rect_in_screen = hook_thumb(check_rect | 1, (uintptr_t)&hooked_CheckRectInScreen);
+        game_log("[Patch] Hooked CGsGraphics::CheckRectInScreen (0x%08X)\n", (unsigned int)check_rect);
     }
 
     uintptr_t char_talk = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript16Script_Char_TalkEP7sScript");
@@ -1940,6 +2041,13 @@ void so_patch(void) {
         game_log("[Patch] Hooked CMvPlayer::SetHonorProgress (0x%08X)\n", (unsigned int)set_honor);
     }
 
+    
+    uintptr_t canmove = (uintptr_t)so_symbol(&so_mod, "_ZN12CMvCharacter7CanMoveE7EnumDiribiiib");
+    if (canmove) {
+        hook_char_canmove = hook_thumb(canmove | 1, (uintptr_t)&hooked_CMvCharacter_CanMove);
+        game_log("[Patch] Hooked CMvCharacter::CanMove (0x%08X)\n", (unsigned int)canmove);
+    }
+
     uintptr_t onmove_1 = (uintptr_t)so_symbol(&so_mod, "_ZN12CMvCharacter6OnMoveEi");
     if (onmove_1) {
         hook_char_onmove_1 = hook_thumb(onmove_1 | 1, (uintptr_t)&hooked_CMvCharacter_OnMove_1);
@@ -1987,4 +2095,20 @@ void so_patch(void) {
         hook_projectile_move = hook_thumb(projectile_move | 1, (uintptr_t)&hooked_CMvProjectile_OnMove);
         game_log("[Patch] Hooked CMvProjectile::OnMove (0x%08X)\n", (unsigned int)projectile_move);
     }
+    // Fix Bug #?: CMvLayerData::PreLoad skips execution because it checks `if (0 < (long)__src)`
+    // Pointers on PS Vita are > 0x81000000, which are negative as signed longs.
+    // 0x947bc: ble -> beq (0xdd 0x1f -> 0xd0 0x1f)
+    uint16_t beq_instr_layer = 0xd01f;
+    kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + 0x947bc), &beq_instr_layer, sizeof(beq_instr_layer));
+
+    // Redirect internal Gcx_MM memory manager and operators new/delete to native malloc/free
+    patch_symbol("_Z12Gcx_MM_Allocj", (uintptr_t)&hooked_Gcx_MM_Alloc);
+    patch_symbol("_Z13Gcx_MM_Callocj", (uintptr_t)&hooked_Gcx_MM_Calloc);
+    patch_symbol("_Z11Gcx_MM_FreePv", (uintptr_t)&hooked_Gcx_MM_Free);
+    patch_symbol("_Z14Gcx_MM_ReallocPvj", (uintptr_t)&hooked_Gcx_MM_Realloc);
+    patch_symbol("_Znwj", (uintptr_t)&hooked_operator_new);
+    patch_symbol("_Znaj", (uintptr_t)&hooked_operator_new_array);
+    patch_symbol("_ZdlPv", (uintptr_t)&hooked_operator_delete);
+    patch_symbol("_ZdaPv", (uintptr_t)&hooked_operator_delete_array);
+
 }
