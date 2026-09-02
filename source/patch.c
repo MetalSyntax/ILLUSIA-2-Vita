@@ -106,6 +106,8 @@ static so_hook hook_encryptfile_loadbegin;
 static so_hook hook_invaliddata_popup;
 static so_hook hook_gsfile_save;
 static so_hook hook_gsfile_load;
+static so_hook hook_gsfsfilesize;
+static so_hook hook_mc_fsfileattribute;
 
 static void *(*MC_grpCreateOffScreenFrameBuffer)(int w, int h) = NULL;
 static uint16_t (*MC_grpGetPixelFromRGB)(uint8_t r, uint8_t g, uint8_t b) = NULL;
@@ -1333,6 +1335,19 @@ static int hooked_CGsFile_Load(void *self, void *data, const char *filename, uin
     return ret;
 }
 
+static int hooked_GsFSFileSize(const char *filename, int mode) {
+    int size = SO_CONTINUE(int, hook_gsfsfilesize, filename, mode);
+    game_log("[SaveIO] GsFSFileSize(\"%s\") -> %d\n", filename ? filename : "null", size);
+    return size;
+}
+
+static int hooked_MC_fsFileAttribute(const char *filename, void *attr) {
+    int ret = SO_CONTINUE(int, hook_mc_fsfileattribute, filename, attr);
+    uint32_t size = attr ? *(uint32_t*)((uintptr_t)attr + 8) : 0;
+    game_log("[SaveIO] MC_fsFileAttribute(\"%s\") -> %d (size=%u)\n", filename ? filename : "null", ret, size);
+    return ret;
+}
+
 /*
  * Hook for CMvGameScript::Script_Char_Talk()
  * _ZN13CMvGameScript16Script_Char_TalkEP7sScript
@@ -2078,6 +2093,18 @@ void so_patch(void) {
     if (gsfile_load) {
         hook_gsfile_load = hook_thumb(gsfile_load | 1, (uintptr_t)&hooked_CGsFile_Load);
         game_log("[Patch] Hooked CGsFile::Load (0x%08X)\n", (unsigned int)gsfile_load);
+    }
+    
+    uintptr_t gsfsfilesize = (uintptr_t)so_symbol(&so_mod, "_Z12GsFSFileSizePKci");
+    if (gsfsfilesize) {
+        hook_gsfsfilesize = hook_thumb(gsfsfilesize | 1, (uintptr_t)&hooked_GsFSFileSize);
+        game_log("[Patch] Hooked GsFSFileSize (0x%08X)\n", (unsigned int)gsfsfilesize);
+    }
+
+    uintptr_t mc_fsfileattr = (uintptr_t)so_symbol(&so_mod, "MC_fsFileAttribute");
+    if (mc_fsfileattr) {
+        hook_mc_fsfileattribute = hook_thumb(mc_fsfileattr | 1, (uintptr_t)&hooked_MC_fsFileAttribute);
+        game_log("[Patch] Hooked MC_fsFileAttribute (0x%08X)\n", (unsigned int)mc_fsfileattr);
     }
 
     uintptr_t char_talk = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript16Script_Char_TalkEP7sScript");

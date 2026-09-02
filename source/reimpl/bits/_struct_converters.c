@@ -90,10 +90,10 @@ void stat_newlib_to_bionic(const struct stat * src, stat64_bionic * dst) {
     dst->st_size = src->st_size;
     dst->st_blksize = src->st_blksize;
     dst->st_blocks = src->st_blocks;
-    dst->st_atim.tv_sec = src->st_atime;
-    dst->st_atim.tv_nsec = 0;
-    dst->st_mtim.tv_sec = src->st_mtime;
-    dst->st_mtim.tv_nsec = 0;
-    dst->st_ctim.tv_sec = src->st_ctime;
-    dst->st_ctim.tv_nsec = 0;
+    dst->st_atim_sec = src->st_atime;
+    dst->st_atim_nsec = 0;
+    dst->st_mtim_sec = src->st_mtime;
+    dst->st_mtim_nsec = 0;
+    dst->st_ctim_sec = src->st_ctime;
+    dst->st_ctim_nsec = 0;
 }
