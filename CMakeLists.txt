@@ -73,6 +73,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/patch.c
                source/reimpl/bits/_ctype.c
                source/reimpl/egl.c
+               source/reimpl/vitagl_splash_stub.c
                source/reimpl/errno.c
                source/reimpl/io.c
                source/reimpl/log.c
@@ -106,6 +107,11 @@ target_include_directories(${CMAKE_PROJECT_NAME}
                            )
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
+                      # vitaGL now ships its own EGL shim (source/egl.c) which duplicates
+                      # every symbol in source/reimpl/egl.c. Keep our own custom shim (it
+                      # drives gl_init()/glutil directly) by letting the linker take the
+                      # first definition it sees instead of erroring on the clash.
+                      -Wl,--allow-multiple-definition
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
                       vitaGL

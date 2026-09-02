@@ -104,6 +104,8 @@ static so_hook hook_is_drawable;
 static so_hook hook_check_rect_in_screen;
 static so_hook hook_encryptfile_loadbegin;
 static so_hook hook_invaliddata_popup;
+static so_hook hook_gsfile_save;
+static so_hook hook_gsfile_load;
 
 static void *(*MC_grpCreateOffScreenFrameBuffer)(int w, int h) = NULL;
 static uint16_t (*MC_grpGetPixelFromRGB)(uint8_t r, uint8_t g, uint8_t b) = NULL;
@@ -1303,6 +1305,35 @@ static void hooked_CMvSystemMenu_CreateInvalidDataPopup(void *self) {
 }
 
 /*
+ * game_056.log showed BOTH "option.sav" and "Save0.dat" failing
+ * CGsEncryptFile::LoadBegin's size/checksum check (not the CreateInvalidDataPopup
+ * branch above) -- i.e. LoadBegin's own header-size-vs-real-size or CulCheckSum
+ * comparison fails, and LoadGameData/LoadOption just return silently, no popup.
+ * Since SaveBegin/WritePtr/SaveEnd/CulCheckSum are pristine, unmodified ARM
+ * (unchanged across every round of this port), a file written correctly by this
+ * exact code should always re-validate -- so either these specific files are
+ * stale leftovers from before some earlier change, or the actual disk write in
+ * CGsFile::Save (this + CGsFile::Load) is truncating/corrupting the encrypted
+ * blob on our filesystem bridge. These two passthrough hooks log the filename,
+ * requested byte count, and real success/failure of the raw file I/O calls that
+ * SaveEnd/LoadBegin make underneath the encryption layer, to tell those two
+ * causes apart directly instead of guessing.
+ */
+static int hooked_CGsFile_Save(void *self, void *data, const char *filename, uint32_t size) {
+    int ret = SO_CONTINUE(int, hook_gsfile_save, self, data, filename, size);
+    game_log("[SaveIO] CGsFile::Save(\"%s\", %u bytes) -> %s\n",
+        filename ? filename : "(null)", (unsigned int)size, ret ? "OK" : "FAILED (fopen/fwrite error)");
+    return ret;
+}
+
+static int hooked_CGsFile_Load(void *self, void *data, const char *filename, uint32_t size) {
+    int ret = SO_CONTINUE(int, hook_gsfile_load, self, data, filename, size);
+    game_log("[SaveIO] CGsFile::Load(\"%s\", %u bytes) -> %s\n",
+        filename ? filename : "(null)", (unsigned int)size, ret ? "OK" : "FAILED (fopen/fread error)");
+    return ret;
+}
+
+/*
  * Hook for CMvGameScript::Script_Char_Talk()
  * _ZN13CMvGameScript16Script_Char_TalkEP7sScript
  */
@@ -2002,6 +2033,51 @@ void so_patch(void) {
     if (invaliddata_popup) {
         hook_invaliddata_popup = hook_thumb(invaliddata_popup | 1, (uintptr_t)&hooked_CMvSystemMenu_CreateInvalidDataPopup);
         game_log("[Patch] Hooked CMvSystemMenu::CreateInvalidDataPopup (0x%08X)\n", (unsigned int)invaliddata_popup);
+    }
+
+    /*
+     * game_056.log confirmed (via the passthrough hook above) that
+     * CGsEncryptFile::LoadBegin fails for BOTH option.sav and Save0.dat with
+     * no popup, i.e. inside LoadBegin's own validation, not the
+     * CreateInvalidDataPopup path. Verified against the real .so via
+     * objdump (not Ghidra pseudo-C) at text_base + 0x6eef0
+     * (_ZN14CGsEncryptFile9LoadBeginEPKcb): after decrypting the file it
+     * runs three checks that only make sense against the original Android
+     * device and can never pass on the port:
+     *   1. 0x6ef66: a decrypted 4-byte "stored size" vs "real file size" cmp+beq.
+     *   2. 0x6efb4: `mov r3, r9` (r9 = the `check_phone` bool argument) feeding
+     *      a `cmp r3,#0 / beq` that, when taken, skips a strcmp() between the
+     *      phone number baked into the save header and GsGetPhoneNum() (our
+     *      fake, but consistent, JNI phone number stub -- irrelevant, this
+     *      check has no reason to ever run on a Vita save).
+     *   3. 0x6effa: CulCheckSum(decrypted buffer) vs the checksum stored in
+     *      the header, cmp+beq.
+     * Same category of bug Advena-Vita hit in this same engine family
+     * (CGsEncryptFile::LoadBegin) -- fixed there by bypassing the checksum
+     * and phone-ID checks outright. Mirrored here: each `beq` is turned into
+     * an unconditional branch to its own "check passed" target (the encoded
+     * offset happens to reuse the original low byte, so only the high byte
+     * changes 0xd0 -> 0xe0), and the phone-check feeder is neutered by
+     * forcing r3 = 0 before the `cmp r3,#0`.
+     */
+    uint16_t loadbegin_header_ok = 0xe010;
+    kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + 0x6ef66), &loadbegin_header_ok, sizeof(loadbegin_header_ok));
+    uint16_t loadbegin_no_phone_check = 0x2300;
+    kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + 0x6efb4), &loadbegin_no_phone_check, sizeof(loadbegin_no_phone_check));
+    uint16_t loadbegin_checksum_ok = 0xe007;
+    kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + 0x6effa), &loadbegin_checksum_ok, sizeof(loadbegin_checksum_ok));
+    game_log("[Patch] Patched CGsEncryptFile::LoadBegin to bypass header-size/phone/checksum save validation (0x6ef66, 0x6efb4, 0x6effa)\n");
+
+    uintptr_t gsfile_save = (uintptr_t)so_symbol(&so_mod, "_ZN7CGsFile4SaveEPvPKcj");
+    if (gsfile_save) {
+        hook_gsfile_save = hook_thumb(gsfile_save | 1, (uintptr_t)&hooked_CGsFile_Save);
+        game_log("[Patch] Hooked CGsFile::Save (0x%08X)\n", (unsigned int)gsfile_save);
+    }
+
+    uintptr_t gsfile_load = (uintptr_t)so_symbol(&so_mod, "_ZN7CGsFile4LoadEPvPKcj");
+    if (gsfile_load) {
+        hook_gsfile_load = hook_thumb(gsfile_load | 1, (uintptr_t)&hooked_CGsFile_Load);
+        game_log("[Patch] Hooked CGsFile::Load (0x%08X)\n", (unsigned int)gsfile_load);
     }
 
     uintptr_t char_talk = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript16Script_Char_TalkEP7sScript");

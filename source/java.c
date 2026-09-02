@@ -26,12 +26,10 @@
 volatile int g_ui_status = -1;
 
 #define SAVE_DIR  "ux0:data/illusia2/saves"
-#define SAVE_DIR2 "ux0:data/illusia2/games"
 
 static void ensure_save_dir(void) {
     sceIoMkdir("ux0:data/illusia2", 0777);
     sceIoMkdir(SAVE_DIR, 0777);
-    sceIoMkdir(SAVE_DIR2, 0777);
 }
 
 // Path resolver for ILLUSIA 2 assets
@@ -648,10 +646,6 @@ jobject Illusia_loadFile(jmethodID id, va_list args) {
     snprintf(path, sizeof(path), "%s/%s", SAVE_DIR, name);
     FILE *f = fopen(path, "rb");
     if (!f) {
-        snprintf(path, sizeof(path), "%s/%s", SAVE_DIR2, name);
-        f = fopen(path, "rb");
-    }
-    if (!f) {
         snprintf(path, sizeof(path), "ux0:data/illusia2/%s", name);
         f = fopen(path, "rb");
         if (!f) return NULL;
@@ -693,11 +687,6 @@ jint Illusia_isFileExist(jmethodID id, va_list args) {
         return (jint) st.st_size;
     }
 
-    snprintf(path, sizeof(path), "%s/%s", SAVE_DIR2, name);
-    if (stat(path, &st) == 0) {
-        return (jint) st.st_size;
-    }
-
     snprintf(path, sizeof(path), "ux0:data/illusia2/%s", name);
     if (stat(path, &st) == 0) {
         return (jint) st.st_size;
@@ -713,8 +702,6 @@ jint Illusia_deleteFile(jmethodID id, va_list args) {
 
     char path[256];
     snprintf(path, sizeof(path), "%s/%s", SAVE_DIR, name);
-    unlink(path);
-    snprintf(path, sizeof(path), "%s/%s", SAVE_DIR2, name);
     unlink(path);
     game_log("[Java] deleteFile: %s\n", name);
     return 1;
