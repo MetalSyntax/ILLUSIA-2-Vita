@@ -108,6 +108,9 @@ static so_hook hook_gsfile_save;
 static so_hook hook_gsfile_load;
 static so_hook hook_gsfsfilesize;
 static so_hook hook_mc_fsfileattribute;
+static so_hook hook_script_playsound;
+static so_hook hook_script_playbgm;
+static so_hook hook_cgssound_play;
 
 static void *(*MC_grpCreateOffScreenFrameBuffer)(int w, int h) = NULL;
 static uint16_t (*MC_grpGetPixelFromRGB)(uint8_t r, uint8_t g, uint8_t b) = NULL;
@@ -1349,6 +1352,71 @@ static int hooked_MC_fsFileAttribute(const char *filename, void *attr) {
 }
 
 /*
+ * Diagnostic passthrough hooks for CMvGameScript::Script_PlaySound/Script_PlayBGM
+ * (_ZN13CMvGameScript16Script_PlaySoundEP7sScript / _ZN13CMvGameScript14Script_PlayBGMEP7sScript).
+ * Both are pristine, unhooked-until-now ARM: they read a sound id from
+ * *(int*)(*(int*)(script+8)+4) and call CGsSound::Play(singleton, id, -1, loop),
+ * with Script_PlaySound hardcoding loop='\0' and Script_PlayBGM hardcoding loop='\x01'
+ * (verified via arm-vita-eabi-nm real symbols, not guessed -- see
+ * decompiled/libgameDSO_armeabi/ghidra/out_ghidra.c:130644-130675). Logging here (before
+ * the real call executes) settles, without reverse-engineering the compiled .zt1 script
+ * bytecode, whether a specific cutscene's music cue (e.g. the user-identified id=110 for
+ * the post-character-select princess scene) is ever actually issued by the script
+ * interpreter, independent of the JNI/audio.c routing already fixed. Pure passthrough,
+ * no behavior change, capped at 100 logs total.
+ */
+static int script_sound_log_count = 0;
+
+static int hooked_CMvGameScript_Script_PlaySound(void *self, void *script) {
+    if (script && script_sound_log_count < 100) {
+        void *script_data = *(void **)((char *)script + 8);
+        if (script_data) {
+            int snd_id = *(int *)((char *)script_data + 4);
+            script_sound_log_count++;
+            game_log("[Script] PlaySound id=%d (loop=0)\n", snd_id);
+        }
+    }
+    return SO_CONTINUE(int, hook_script_playsound, self, script);
+}
+
+static int hooked_CMvGameScript_Script_PlayBGM(void *self, void *script) {
+    if (script && script_sound_log_count < 100) {
+        void *script_data = *(void **)((char *)script + 8);
+        if (script_data) {
+            int snd_id = *(int *)((char *)script_data + 4);
+            script_sound_log_count++;
+            game_log("[Script] PlayBGM id=%d (loop=1)\n", snd_id);
+        }
+    }
+    return SO_CONTINUE(int, hook_script_playbgm, self, script);
+}
+
+/*
+ * Diagnostic passthrough hook for CGsSound::Play(int,int,uchar)
+ * (_ZN8CGsSound4PlayEiih) -- the single real choke point BOTH Script_PlaySound and
+ * Script_PlayBGM call internally (out_ghidra.c:130651/130669), and per round-18 evidence
+ * (both those two hooks logged zero hits across a full game_073.log session while dozens
+ * of OnSoundPlay calls fired), evidently also called directly by other, not-yet-identified
+ * engine code (character/combat/UI SFX, menu music) that bypasses the generic script
+ * opcodes entirely. Logs the caller's real return address (offset from so_mod.text_base)
+ * alongside id/vol/loop so the actual calling function can be identified afterward via
+ * `arm-vita-eabi-nm -D --size-sort` / objdump on the real .so, without guessing. Pure
+ * passthrough, no behavior change, capped at 150 logs total.
+ */
+static int cgssound_play_log_count = 0;
+
+static int hooked_CGsSound_Play(void *self, int snd_id, int vol, unsigned char loop) {
+    if (cgssound_play_log_count < 150) {
+        cgssound_play_log_count++;
+        void *ret = __builtin_return_address(0);
+        uintptr_t caller_off = (uintptr_t)ret - so_mod.text_base;
+        game_log("[Sound] CGsSound::Play id=%d vol=%d loop=%d caller=+0x%x\n",
+                 snd_id, vol, (int)loop, (unsigned int)caller_off);
+    }
+    return SO_CONTINUE(int, hook_cgssound_play, self, snd_id, vol, loop);
+}
+
+/*
  * Hook for CMvGameScript::Script_Char_Talk()
  * _ZN13CMvGameScript16Script_Char_TalkEP7sScript
  */
@@ -2105,6 +2173,24 @@ void so_patch(void) {
     if (mc_fsfileattr) {
         hook_mc_fsfileattribute = hook_thumb(mc_fsfileattr | 1, (uintptr_t)&hooked_MC_fsFileAttribute);
         game_log("[Patch] Hooked MC_fsFileAttribute (0x%08X)\n", (unsigned int)mc_fsfileattr);
+    }
+
+    uintptr_t cgssound_play = (uintptr_t)so_symbol(&so_mod, "_ZN8CGsSound4PlayEiih");
+    if (cgssound_play) {
+        hook_cgssound_play = hook_thumb(cgssound_play | 1, (uintptr_t)&hooked_CGsSound_Play);
+        game_log("[Patch] Hooked CGsSound::Play (0x%08X)\n", (unsigned int)cgssound_play);
+    }
+
+    uintptr_t script_playsound = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript16Script_PlaySoundEP7sScript");
+    if (script_playsound) {
+        hook_script_playsound = hook_thumb(script_playsound | 1, (uintptr_t)&hooked_CMvGameScript_Script_PlaySound);
+        game_log("[Patch] Hooked CMvGameScript::Script_PlaySound (0x%08X)\n", (unsigned int)script_playsound);
+    }
+
+    uintptr_t script_playbgm = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript14Script_PlayBGMEP7sScript");
+    if (script_playbgm) {
+        hook_script_playbgm = hook_thumb(script_playbgm | 1, (uintptr_t)&hooked_CMvGameScript_Script_PlayBGM);
+        game_log("[Patch] Hooked CMvGameScript::Script_PlayBGM (0x%08X)\n", (unsigned int)script_playbgm);
     }
 
     uintptr_t char_talk = (uintptr_t)so_symbol(&so_mod, "_ZN13CMvGameScript16Script_Char_TalkEP7sScript");

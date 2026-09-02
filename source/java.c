@@ -577,10 +577,35 @@ void Illusia_OnUIStatusChange(jmethodID id, va_list args) {
     g_ui_status = status;
 }
 
+static int onsoundplay_log_count = 0;
+
 void Illusia_OnSoundPlay(jmethodID id, va_list args) {
     int snd_id = va_arg(args, int);
     int vol = va_arg(args, int);
     int is_loop = va_arg(args, int);
+
+    if (onsoundplay_log_count < 200) {
+        onsoundplay_log_count++;
+        game_log("[Java] OnSoundPlay: id=%d vol=%d loop=%d\n", snd_id, vol, is_loop);
+    }
+
+    /* `snd_id` here is NOT a real sNNN.ogg file number -- it's the position of the real
+     * id within the game's internal 84-entry registered-sound-id list
+     * (CGsSound::GetSoundIDListIdx), which audio_play() translates back to a real file
+     * number (see the long comment on translate_sound_index() in source/audio.c). This
+     * check must run on the RAW index, BEFORE that translation, to exactly match the
+     * real engine (SkeletonUIControllerView.OnSoundPlay), which does the same check on
+     * this same raw index before its own translation (`R.raw.s000 + i`) --
+     * decompiled/apk_jadx/sources/.../SkeletonUIControllerView.java:212-213:
+     *   if (i == 4 || i == 17 || i == 59 || (i <= 75 && i >= 99)) { /* no-op *\/ }
+     * (the second half of that condition is unreachable dead code -- i<=75 && i>=99
+     * can never both hold -- so only these three literal index values matter; they are
+     * known-stale legacy indices the real game deliberately no-ops rather than playing
+     * whatever real sound happens to occupy that slot in the current build). */
+    if (snd_id == 4 || snd_id == 17 || snd_id == 59) {
+        return;
+    }
+
     audio_play(snd_id, vol, is_loop);
 }
 
